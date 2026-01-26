@@ -3,3 +3,18 @@ title: "proj0"
 output: html_document
 ---
 
+
+good adherence: within 7.5min before/after the timepoint
+adequate adherence: +- 15min
+
+dont use MEMs/Booklet sample interval time
+
+use nmol/L units
+
+Consider excluding super high DHEA level
+
+# q1
+
+mixed model
+correlation
+take average in difference
