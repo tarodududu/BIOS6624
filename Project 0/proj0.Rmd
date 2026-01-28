@@ -3,7 +3,15 @@ title: "proj0"
 output: html_document
 ---
 
+```{r}
+library(tidyverse)    # Data manipulation and visualization
+library(lubridate)    # Date/time handling
+library(gridExtra)    # Arranging multiple plots
+library(knitr)        # Tables
+library(kableExtra)   # Enhanced tables
+library(scales)       # Axis formatting
 
+```
 good adherence: within 7.5min before/after the timepoint
 adequate adherence: +- 15min
 
@@ -18,3 +26,307 @@ Consider excluding super high DHEA level
 mixed model
 correlation
 take average in difference
+
+
+## Data cleaning
+
+```{r}
+data_raw<-read.csv("Project0_Clean_v2.csv")
+head(data_raw)
+
+data <- data_raw %>%
+  rename(
+    SubjectID = SubjectID,
+    CollectionDate = Collection.Date,
+    CollectionSample = Collection.Sample,
+    Booklet_ClockTime = Booket..Clock.Time,           # Note: typo in original "Booket"
+    MEMs_ClockTime = MEMs..Clock.Time,
+    SleepDiary_WakeTime = Sleep.Diary.reported.wake.time,
+    Booklet_SampleInterval = Booklet..Sample.interval,
+    Booklet_SampleInterval_Mins = Booklet..Sample.interval.Decimal.Time..mins.,
+    MEMs_SampleInterval = MEMs..Sample.interval,
+    MEMs_SampleInterval_Mins = MEMs..Sample.interval.Decimal.Time..mins.,
+    Cortisol_ugdl = Cortisol..ug.dl.,
+    DHEA_pgdl = DHEA..pg.dl.,
+    Cortisol_nmolL = Cortisol..nmol.L.,
+    DHEA_nmolL = DHEA..nmol.L.,
+    DayNumber = DAYNUMB
+  )
+
+## DATE/TIME HANDLING
+# Function to parse time strings (handles hh:mm format)
+parse_time_hhmm <- function(time_str) {
+  # Return NA for empty strings or NA values
+  if (is.na(time_str) || time_str == "") {
+    return(NA)
+  }
+  # Parse hh:mm format
+  parsed <- hm(time_str)
+  return(parsed)
+}
+
+# Function to convert time string to minutes since midnight
+time_to_minutes <- function(time_str) {
+  if (is.na(time_str) || time_str == "") {
+    return(NA)
+  }
+  parts <- strsplit(time_str, ":")[[1]]
+  if (length(parts) >= 2) {
+    hours <- as.numeric(parts[1])
+    mins <- as.numeric(parts[2])
+    return(hours * 60 + mins)
+  }
+  return(NA)
+}
+
+# Apply time conversion to create minutes since midnight for clock times
+data <- data %>%
+  mutate(
+    # Convert clock times to minutes since midnight
+    Booklet_ClockTime_Mins = sapply(Booklet_ClockTime, time_to_minutes),
+    MEMs_ClockTime_Mins = sapply(MEMs_ClockTime, time_to_minutes),
+    WakeTime_Mins_Raw = sapply(SleepDiary_WakeTime, time_to_minutes)
+  )
+
+# Calculate time since waking
+data <- data %>%
+  mutate(
+    # Time since waking calculated from clock times minus wake time
+    Booklet_TimeSinceWaking = Booklet_ClockTime_Mins - WakeTime_Mins_Raw,
+    MEMs_TimeSinceWaking = MEMs_ClockTime_Mins - WakeTime_Mins_Raw
+  )
+
+
+
+data <- data %>%
+  group_by(SubjectID, DayNumber) %>%
+  mutate(
+    # Fill wake time: take the non-NA value from Sample 1 and apply to all samples
+    WakeTime_Mins = WakeTime_Mins_Raw[CollectionSample == 1][1]
+  ) %>%
+  ungroup()
+
+data <- data %>%
+  mutate(
+    # Time since waking calculated from clock times minus wake time
+    Booklet_TimeSinceWaking = Booklet_ClockTime_Mins - WakeTime_Mins,
+    MEMs_TimeSinceWaking = MEMs_ClockTime_Mins - WakeTime_Mins
+  )
+
+head(data)
+```
+
+```{r}
+## EXCLUDE EXTREME VALUES
+
+# Flag/exclude implausible cortisol values
+# - Values > 80 nmol/L are lab errors (EXCLUDE)
+# - Values > 26 nmol/L are high but biologically possible (FLAG)
+data <- data %>%
+  mutate(
+    Cortisol_LabError = Cortisol_nmolL > 80,
+    Cortisol_High = Cortisol_nmolL > 26 & Cortisol_nmolL <= 80,
+    # Flag the extreme cortisol value (9999 appears to be an error code)
+    Cortisol_LabError = ifelse(Cortisol_nmolL > 1000, TRUE, Cortisol_LabError)
+  )
+
+# Flag DHEA at detection limit (5.205 nmol/L)
+data <- data %>%
+  mutate(
+    DHEA_AtDetectionLimit = abs(DHEA_nmolL - 5.205) < 0.001
+  )
+
+# Identify subjects with multiple DHEA at detection limit
+subjects_multiple_DHEA_limit <- data %>%
+  filter(DHEA_AtDetectionLimit) %>%
+  group_by(SubjectID) %>%
+  summarise(n_at_limit = n()) %>%
+  filter(n_at_limit > 1)
+
+
+data <- data %>%
+  mutate(
+    SubjectID_Factor = as.factor(SubjectID),
+    CollectionSample_Factor = factor(CollectionSample, 
+                                      levels = 1:4,
+                                      labels = c("Waking", "30 min", "Lunch", "10 hours")),
+    DayNumber_Factor = factor(DayNumber, levels = 1:3, labels = c("Day 1", "Day 2", "Day 3"))
+  )
+
+head(data)
+
+
+missing_summary <- data %>%
+  summarise(
+    Total_Observations = n(),
+    Missing_Booklet_ClockTime = sum(is.na(Booklet_ClockTime_Mins)),
+    Missing_MEMs_ClockTime = sum(is.na(MEMs_ClockTime_Mins)),
+    Missing_WakeTime = sum(is.na(WakeTime_Mins)),
+    Missing_Cortisol = sum(is.na(Cortisol_nmolL)),
+    Missing_DHEA = sum(is.na(DHEA_nmolL)),
+    Excluded_Cortisol_LabError = sum(Cortisol_LabError, na.rm = TRUE),
+    Excluded_DHEA_DetectionLimit = sum(DHEA_AtDetectionLimit, na.rm = TRUE)
+  )
+
+missing_summary_long <- missing_summary %>%
+  pivot_longer(cols = everything(), names_to = "Variable", values_to = "Count") %>%
+  mutate(Percentage = round(100 * Count / missing_summary$Total_Observations, 1))
+
+print(missing_summary_long)
+
+missing_heatmap_data <- data %>%
+  mutate(
+    MEMs_Missing = ifelse(is.na(MEMs_ClockTime_Mins), 1, 0)
+  ) %>%
+  select(SubjectID, DayNumber, CollectionSample, MEMs_Missing)
+
+plot_missing_heatmap <- ggplot(missing_heatmap_data, 
+                                aes(x = factor(CollectionSample), 
+                                    y = factor(SubjectID),
+                                    fill = factor(MEMs_Missing))) +
+  geom_tile(color = "white") +
+  facet_wrap(~ factor(DayNumber, labels = c("Day 1", "Day 2", "Day 3"))) +
+  scale_fill_manual(values = c("0" = "steelblue", "1" = "tomato"),
+                    labels = c("Present", "Missing"),
+                    name = "MEMs Time") +
+  labs(title = "Missing MEMs Clock Times by Subject, Day, and Sample",
+       x = "Collection Sample",
+       y = "Subject ID") +
+  theme(axis.text.y = element_text(size = 6))
+
+print(plot_missing_heatmap)
+ggsave("missing_data_heatmap.png", plot_missing_heatmap, width = 12, height = 10, dpi = 150)
+```
+
+```{r}
+# Q1 DESCRIPTIVE STATISTICS
+
+data_paired <- data %>%
+  filter(!is.na(Booklet_TimeSinceWaking) & !is.na(MEMs_TimeSinceWaking))
+
+data_paired <- data_paired %>%
+  mutate(
+    # Difference: Booklet - MEMs (positive = Booklet later than MEMs)
+    Time_Difference = Booklet_TimeSinceWaking - MEMs_TimeSinceWaking,
+    # Average of the two measurements (for Bland-Altman)
+    Time_Average = (Booklet_TimeSinceWaking + MEMs_TimeSinceWaking) / 2,
+    # Absolute difference
+    Abs_Difference = abs(Time_Difference)
+  )
+
+
+
+diff_summary_overall <- data_paired %>%
+  summarise(
+    N = n(),
+    Mean_Diff = mean(Time_Difference, na.rm = TRUE),
+    SD_Diff = sd(Time_Difference, na.rm = TRUE),
+    Median_Diff = median(Time_Difference, na.rm = TRUE),
+    IQR_Diff = IQR(Time_Difference, na.rm = TRUE),
+    Min_Diff = min(Time_Difference, na.rm = TRUE),
+    Max_Diff = max(Time_Difference, na.rm = TRUE),
+    Mean_Abs_Diff = mean(Abs_Difference, na.rm = TRUE)
+  )
+
+cat("--- Overall Time Difference (Booklet - MEMs, in minutes) ---\n")
+print(diff_summary_overall)
+
+# Calculate 95% Limits of Agreement
+mean_diff <- diff_summary_overall$Mean_Diff
+sd_diff <- diff_summary_overall$SD_Diff
+LoA_lower <- mean_diff - 1.96 * sd_diff
+LoA_upper <- mean_diff + 1.96 * sd_diff
+
+cat("\n--- Bland-Altman Statistics ---\n")
+cat("Mean Difference (Bias):", round(mean_diff, 2), "minutes\n")
+cat("95% Limits of Agreement:", round(LoA_lower, 2), "to", round(LoA_upper, 2), "minutes\n")
+
+# -----------------------------------------------------------------------------
+# 3.4 Summary by Collection Sample
+# -----------------------------------------------------------------------------
+diff_summary_by_sample <- data_paired %>%
+  group_by(CollectionSample_Factor) %>%
+  summarise(
+    N = n(),
+    Mean_Diff = round(mean(Time_Difference), 2),
+    SD_Diff = round(sd(Time_Difference), 2),
+    Median_Diff = round(median(Time_Difference), 2),
+    Min_Diff = round(min(Time_Difference), 2),
+    Max_Diff = round(max(Time_Difference), 2)
+  )
+
+cat("\n--- Time Difference by Collection Sample ---\n")
+print(diff_summary_by_sample)
+
+
+# -----------------------------------------------------------------------------
+# 3.5 Correlation between Booklet and MEMs times
+# -----------------------------------------------------------------------------
+correlation_test <- cor.test(data_paired$Booklet_TimeSinceWaking, 
+                              data_paired$MEMs_TimeSinceWaking,
+                              method = "pearson")
+
+cat("\n--- Pearson Correlation ---\n")
+cat("Correlation coefficient (r):", round(correlation_test$estimate, 4), "\n")
+cat("95% CI:", round(correlation_test$conf.int[1], 4), "to", 
+    round(correlation_test$conf.int[2], 4), "\n")
+cat("p-value:", format.pval(correlation_test$p.value, digits = 3), "\n")
+
+# -----------------------------------------------------------------------------
+# 3.6 VISUALIZATION: Scatterplot (per PI request)
+# -----------------------------------------------------------------------------
+plot_scatter_agreement <- ggplot(data_paired, 
+                                  aes(x = MEMs_TimeSinceWaking, 
+                                      y = Booklet_TimeSinceWaking)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red", linewidth = 1) +
+  geom_smooth(method = "lm", se = TRUE, color = "darkblue", linewidth = 0.8) +
+  labs(
+    title = "Agreement Between Booklet and MEMs Recording Times",
+    subtitle = paste0("Pearson r = ", round(correlation_test$estimate, 3),
+                      " (95% CI: ", round(correlation_test$conf.int[1], 3), 
+                      " to ", round(correlation_test$conf.int[2], 3), ")"),
+    x = "MEMs Time Since Waking (minutes)",
+    y = "Booklet Time Since Waking (minutes)"
+  ) +
+  annotate("text", x = max(data_paired$MEMs_TimeSinceWaking, na.rm = TRUE) * 0.2, 
+           y = max(data_paired$Booklet_TimeSinceWaking, na.rm = TRUE) * 0.9,
+           label = "Identity line (y = x)", color = "red", size = 3.5) +
+  coord_equal() +
+  theme(plot.subtitle = element_text(size = 10))
+
+print(plot_scatter_agreement)
+ggsave("Q1_scatterplot_agreement.png", plot_scatter_agreement, width = 8, height = 8, dpi = 150)
+
+# -----------------------------------------------------------------------------
+# 3.7 VISUALIZATION: Bland-Altman Plot
+# -----------------------------------------------------------------------------
+plot_bland_altman <- ggplot(data_paired, aes(x = Time_Average, y = Time_Difference)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_hline(yintercept = mean_diff, color = "blue", linewidth = 1) +
+  geom_hline(yintercept = LoA_lower, color = "red", linetype = "dashed", linewidth = 0.8) +
+  geom_hline(yintercept = LoA_upper, color = "red", linetype = "dashed", linewidth = 0.8) +
+  geom_hline(yintercept = 0, color = "gray40", linetype = "dotted") +
+  labs(
+    title = "Bland-Altman Plot: Agreement Between Booklet and MEMs",
+    subtitle = paste0("Bias = ", round(mean_diff, 2), " min; ",
+                      "95% LoA: ", round(LoA_lower, 2), " to ", round(LoA_upper, 2), " min"),
+    x = "Average of Booklet and MEMs Time Since Waking (minutes)",
+    y = "Difference (Booklet - MEMs) in minutes"
+  ) +
+  annotate("text", x = max(data_paired$Time_Average, na.rm = TRUE) * 0.85, 
+           y = mean_diff + 2, label = paste("Mean =", round(mean_diff, 2)), 
+           color = "blue", size = 3.5) +
+  annotate("text", x = max(data_paired$Time_Average, na.rm = TRUE) * 0.85, 
+           y = LoA_upper + 2, label = paste("+1.96 SD =", round(LoA_upper, 2)), 
+           color = "red", size = 3.5) +
+  annotate("text", x = max(data_paired$Time_Average, na.rm = TRUE) * 0.85, 
+           y = LoA_lower - 2, label = paste("-1.96 SD =", round(LoA_lower, 2)), 
+           color = "red", size = 3.5) +
+  theme(plot.subtitle = element_text(size = 10))
+
+print(plot_bland_altman)
+#ggsave("Q1_bland_altman.png", plot_bland_altman, width = 10, height = 7, dpi = 150)
+
+```
+
