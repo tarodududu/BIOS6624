@@ -10,7 +10,7 @@ library(gridExtra)    # Arranging multiple plots
 library(knitr)        # Tables
 library(kableExtra)   # Enhanced tables
 library(scales)       # Axis formatting
-
+library(lme4)
 ```
 good adherence: within 7.5min before/after the timepoint
 adequate adherence: +- 15min
@@ -326,7 +326,337 @@ plot_bland_altman <- ggplot(data_paired, aes(x = Time_Average, y = Time_Differen
   theme(plot.subtitle = element_text(size = 10))
 
 print(plot_bland_altman)
-#ggsave("Q1_bland_altman.png", plot_bland_altman, width = 10, height = 7, dpi = 150)
+ggsave("Q1_bland_altman.png", plot_bland_altman, width = 10, height = 7, dpi = 150)
+
+```
+```{r}
+# Q1 Mixed model
+model_agreement <- lmer(Booklet_TimeSinceWaking ~ MEMs_TimeSinceWaking + (1|SubjectID), 
+                        data = data_paired)
+summary(model_agreement)
+```
+```{r}
+
+# Q2 
+
+# Define target times (in minutes since waking)
+TARGET_SAMPLE2 <- 30    # 30 minutes after waking
+TARGET_SAMPLE4 <- 600   # 600 minutes (10 hours) after waking
+
+# Filter to samples 2 and 4 only, and require MEMs time to be present
+data_adherence <- data %>%
+  filter(CollectionSample %in% c(2, 4)) %>%
+  filter(!is.na(MEMs_TimeSinceWaking)) %>%
+  mutate(
+    # Define target time based on sample
+    Target_Time = case_when(
+      CollectionSample == 2 ~ TARGET_SAMPLE2,
+      CollectionSample == 4 ~ TARGET_SAMPLE4
+    ),
+    # Calculate deviation from target
+    Deviation = MEMs_TimeSinceWaking - Target_Time,
+    Abs_Deviation = abs(Deviation),
+    # Adherence flags
+    Within_7.5min = Abs_Deviation <= 7.5,
+    Within_15min = Abs_Deviation <= 15,
+    # Label for reporting
+    Sample_Label = case_when(
+      CollectionSample == 2 ~ "+30 min",
+      CollectionSample == 4 ~ "+10 hours"
+    )
+  )
+
+# =============================================================================
+# CALCULATE ADHERENCE PERCENTAGES WITH 95% CONFIDENCE INTERVALS
+# =============================================================================
+
+# Function to calculate adherence with exact binomial CI
+calc_adherence <- function(data, sample_num, window_min) {
+  
+  subset_data <- data %>% filter(CollectionSample == sample_num)
+  n <- nrow(subset_data)
+  
+  if (window_min == 7.5) {
+    x <- sum(subset_data$Within_7.5min)
+  } else {
+    x <- sum(subset_data$Within_15min)
+  }
+  
+  # Exact binomial CI
+  ci <- binom.test(x, n, conf.level = 0.95)
+  
+  return(data.frame(
+    Sample = ifelse(sample_num == 2, "+30 min", "+10 hours"),
+    Target_Time = ifelse(sample_num == 2, "30 min", "600 min"),
+    Window = paste0("±", window_min, " min"),
+    N_Total = n,
+    N_Adherent = x,
+    Percentage = round(100 * x / n, 1),
+    CI_Lower = round(100 * ci$conf.int[1], 1),
+    CI_Upper = round(100 * ci$conf.int[2], 1)
+  ))
+}
+
+# Calculate for all combinations
+adherence_results <- bind_rows(
+  calc_adherence(data_adherence, 2, 7.5),
+  calc_adherence(data_adherence, 2, 15),
+  calc_adherence(data_adherence, 4, 7.5),
+  calc_adherence(data_adherence, 4, 15)
+)
+
+print(adherence_results)
 
 ```
 
+```{r}
+# Q3
+
+# Find all observations at detection limit
+obs_at_limit <- data %>%
+  filter(DHEA_AtDetectionLimit) %>%
+  select(SubjectID, DayNumber, CollectionSample, DHEA_nmolL)
+
+print(obs_at_limit)
+
+KNOT<-30
+
+data_Q3 <- data %>%
+  filter(!DHEA_AtDetectionLimit) %>%                    # Remove obs at detection limit
+  filter(SubjectID!=3037) %>%               # Remove subjects with multiple at limit
+  filter(!is.na(DHEA_nmolL)) %>%               # Remove subjects with multiple at limit
+  filter(Cortisol_nmolL<=80)    %>%                       # Remove extreme cortisol values
+  filter(!is.na(MEMs_TimeSinceWaking)) %>%
+  filter(MEMs_TimeSinceWaking>= 0) %>%
+  mutate(
+    Time = MEMs_TimeSinceWaking,
+    Time1 = pmin(Time, KNOT),
+    Time2 = pmax(Time - KNOT, 0),)
+
+
+# Model: Cortisol ~ Time1 + Time2 + (1|SubjectID) + (1|SubjectID:DayNumber)
+# 
+# Interpretation:
+# - Intercept: Expected cortisol at waking (Time = 0)
+# - Time1 coefficient: Rate of change from waking to 30 min (awakening response)
+# - Time2 coefficient: Rate of change after 30 min (decline phase)
+
+model_cortisol_pw <- lmer(
+  Cortisol_nmolL ~ Time1 + Time2 + (1|SubjectID_Factor),
+  data = data_Q3
+)
+
+# without random intercept
+model_cortisol_pw2 <- lm(
+  Cortisol_nmolL ~ Time1 + Time2,
+  data = data_Q3
+)
+
+AIC(model_cortisol_pw, model_cortisol_pw2)
+
+summary(model_cortisol_pw)
+
+# --- Model 2: Add quadratic term for Time1 (0-30 min phase) ---
+data_Q3 <- data_Q3 %>%
+  mutate(
+    Time1_sq = Time1^2,
+    Time2_sq = Time2^2
+  )
+model_linear<- model_cortisol_pw
+model_quad_time1 <- lmer(Cortisol_nmolL ~ Time1 + Time1_sq + Time2 + (1|SubjectID_Factor), data = data_Q3)
+
+# --- Model 3: Add quadratic term for Time2 (post-30 min phase) ---
+model_quad_time2 <- lmer(Cortisol_nmolL ~ Time1 + Time2 + Time2_sq + (1|SubjectID_Factor), data = data_Q3)
+
+# --- Model 4: Quadratic terms for both phases ---
+model_quad_both <- lmer(Cortisol_nmolL ~ Time1 + Time1_sq + Time2 + Time2_sq + (1|SubjectID_Factor), data = data_Q3)
+
+# --- Model 5: Simple quadratic (no piecewise, just Time + Time^2) ---
+data_Q3 <- data_Q3 %>%
+  mutate(Time_sq = Time^2)
+model_simple_quad <- lmer(Cortisol_nmolL ~ Time + Time_sq + + (1|SubjectID_Factor), data = data_Q3)
+
+# Create comparison table
+model_comparison <- data.frame(
+  Model = c(
+    "1. Piecewise Linear",
+    "2. Piecewise + Quad(Time1)",
+    "3. Piecewise + Quad(Time2)",
+    "4. Piecewise + Quad(Both)",
+    "5. Simple Quadratic"
+  ),
+  Formula = c(
+    "Y ~ Time1 + Time2",
+    "Y ~ Time1 + Time1² + Time2",
+    "Y ~ Time1 + Time2 + Time2²",
+    "Y ~ Time1 + Time1² + Time2 + Time2²",
+    "Y ~ Time + Time²"
+  ),
+  R2 = c(
+    summary(model_linear)$r.squared,
+    summary(model_quad_time1)$r.squared,
+    summary(model_quad_time2)$r.squared,
+    summary(model_quad_both)$r.squared,
+    summary(model_simple_quad)$r.squared
+  ),
+  Adj_R2 = c(
+    summary(model_linear)$adj.r.squared,
+    summary(model_quad_time1)$adj.r.squared,
+    summary(model_quad_time2)$adj.r.squared,
+    summary(model_quad_both)$adj.r.squared,
+    summary(model_simple_quad)$adj.r.squared
+  ),
+  AIC = c(
+    AIC(model_linear),
+    AIC(model_quad_time1),
+    AIC(model_quad_time2),
+    AIC(model_quad_both),
+    AIC(model_simple_quad)
+  ),
+  BIC = c(
+    BIC(model_linear),
+    BIC(model_quad_time1),
+    BIC(model_quad_time2),
+    BIC(model_quad_both),
+    BIC(model_simple_quad)
+  )
+)
+
+# Format and print
+model_comparison <- model_comparison %>%
+  mutate(
+    R2 = round(R2, 4),
+    Adj_R2 = round(Adj_R2, 4),
+    AIC = round(AIC, 2),
+    BIC = round(BIC, 2)
+  )
+
+print(model_comparison)
+```
+
+```{r}
+# Q3 model diagnostics
+
+# Extract fitted values and residuals
+data_Q3 <- data_Q3 %>%
+  mutate(
+    Fitted = fitted(model_cortisol_pw2),
+    Residuals = residuals(model_cortisol_pw2),
+    Std_Residuals = rstandard(model_cortisol_pw2)
+  )
+
+# =============================================================================
+# 1. RESIDUALS VS FITTED VALUES
+# =============================================================================
+
+plot_resid_vs_fitted <- ggplot(data_Q3, aes(x = Fitted, y = Residuals)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed", linewidth = 1) +
+  geom_smooth(method = "loess", se = FALSE, color = "darkblue", linewidth = 0.8) +
+  labs(
+    title = "Residuals vs Fitted Values",
+    subtitle = "Check for: constant spread (homoscedasticity), no curved pattern",
+    x = "Fitted Values (nmol/L)",
+    y = "Residuals"
+  ) +
+  theme_bw()
+
+print(plot_resid_vs_fitted)
+ggsave("Diag_1_Residuals_vs_Fitted.png", plot_resid_vs_fitted, width = 8, height = 6, dpi = 150)
+
+# =============================================================================
+# 2. RESIDUALS VS TIME
+# =============================================================================
+
+KNOT <- 30
+
+plot_resid_vs_time <- ggplot(data_Q3, aes(x = Time, y = Residuals)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed", linewidth = 1) +
+  geom_smooth(method = "loess", se = FALSE, color = "darkblue", linewidth = 0.8) +
+  geom_vline(xintercept = KNOT, linetype = "dotted", color = "darkgreen", linewidth = 0.8) +
+  annotate("text", x = KNOT + 15, y = max(data_Q3$Residuals, na.rm = TRUE) * 0.9,
+           label = "Knot = 30 min", color = "darkgreen", hjust = 0, size = 3.5) +
+  labs(
+    title = "Residuals vs Time Since Waking",
+    subtitle = "Check for: no systematic pattern, especially around the knot",
+    x = "Time Since Waking (minutes)",
+    y = "Residuals"
+  ) +
+  theme_bw()
+
+print(plot_resid_vs_time)
+
+plot_qq <- ggplot(data_Q3, aes(sample = Std_Residuals)) +
+  stat_qq(alpha = 0.5, color = "steelblue") +
+  stat_qq_line(color = "red", linewidth = 1) +
+  labs(
+    title = "Q-Q Plot of Standardized Residuals",
+    subtitle = "Check for: points following the diagonal line (normality)",
+    x = "Theoretical Quantiles",
+    y = "Sample Quantiles"
+  ) +
+  theme_bw()
+
+print(plot_qq)
+
+# Calculate R-squared for annotation
+r_squared <- summary(model_cortisol_pw2)$r.squared
+
+plot_pred_vs_obs <- ggplot(data_Q3, aes(x = Fitted, y = Cortisol_nmolL)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed", linewidth = 1) +
+  geom_smooth(method = "lm", se = FALSE, color = "darkblue", linewidth = 0.8) +
+  annotate("text", 
+           x = min(data_Q3$Fitted, na.rm = TRUE) + 1,
+           y = max(data_Q3$Cortisol_nmolL, na.rm = TRUE) * 0.95,
+           label = paste0("R² = ", round(r_squared, 3)),
+           hjust = 0, size = 4, color = "darkblue") +
+  labs(
+    title = "Predicted vs Observed Cortisol",
+    subtitle = "Red dashed = perfect prediction (y = x); Blue = actual fit",
+    x = "Predicted Cortisol (nmol/L)",
+    y = "Observed Cortisol (nmol/L)"
+  ) +
+  coord_equal() +
+  theme_bw()
+
+print(plot_pred_vs_obs)
+
+
+plot_cortisol_2 <- ggplot(data_Q3, aes(x = Time, y = Cortisol_nmolL, color = factor(CollectionSample))) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_vline(xintercept = KNOT, linetype = "dashed", color = "gray40", linewidth = 0.8) +
+  scale_color_manual(
+    values = c("1" = "#E41A1C", "2" = "#377EB8", "3" = "#4DAF4A", "4" = "#984EA3"),
+    labels = c("1" = "Waking", "2" = "30 min", "3" = "Lunch", "4" = "10 hours"),
+    name = "Collection Sample"
+  ) +
+  labs(
+    title = "Cortisol Over Time by Collection Sample",
+    subtitle = "Each color represents a different scheduled sampling time",
+    x = "Time Since Waking (minutes)",
+    y = "Cortisol (nmol/L)"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "bottom")
+
+print(plot_cortisol_2)
+
+# --- Plot 2a: DHEA vs Time with LOESS ---
+plot_dhea_1 <- ggplot(data_Q3, aes(x = Time, y = DHEA_nmolL)) +
+  geom_point(alpha = 0.4, color = "forestgreen") +
+  geom_smooth(method = "loess", se = TRUE, color = "darkgreen", linewidth = 1, span = 0.3) +
+  geom_vline(xintercept = KNOT, linetype = "dashed", color = "red", linewidth = 0.8) +
+  annotate("text", x = KNOT + 15, y = max(data_Q3$DHEA_nmolL, na.rm = TRUE) * 0.95,
+           label = "Knot = 30 min", color = "red", hjust = 0, size = 3.5) +
+  labs(
+    title = "DHEA Over Time Since Waking",
+    subtitle = "Green line = LOESS smooth with 95% CI",
+    x = "Time Since Waking (minutes)",
+    y = "DHEA (nmol/L)"
+  ) +
+  theme_bw(base_size = 12)
+
+print(plot_dhea_1)
+```
