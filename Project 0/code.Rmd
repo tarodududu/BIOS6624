@@ -1,0 +1,544 @@
+---
+title: "proj0"
+output: html_document
+---
+
+```{r}
+library(tidyverse)    # Data manipulation and visualization
+library(lubridate)    # Date/time handling
+library(gridExtra)    # Arranging multiple plots
+library(knitr)        # Tables
+library(kableExtra)   # Enhanced tables
+library(scales)       # Axis formatting
+library(lme4)
+library(lmerTest)
+```
+good adherence: within 7.5min before/after the timepoint
+adequate adherence: +- 15min
+
+dont use MEMs/Booklet sample interval time
+
+use nmol/L units
+
+Consider excluding super high DHEA level
+
+# q1
+
+mixed model
+correlation
+take average in difference
+
+
+## Data cleaning
+
+```{r}
+data_raw<-read.csv("Project0_Clean_v2.csv")
+head(data_raw)
+
+data <- data_raw %>%
+  rename(
+    SubjectID = SubjectID,
+    CollectionDate = Collection.Date,
+    CollectionSample = Collection.Sample,
+    Booklet_ClockTime = Booket..Clock.Time,           # Note: typo in original "Booket"
+    MEMs_ClockTime = MEMs..Clock.Time,
+    SleepDiary_WakeTime = Sleep.Diary.reported.wake.time,
+    Booklet_SampleInterval = Booklet..Sample.interval,
+    Booklet_SampleInterval_Mins = Booklet..Sample.interval.Decimal.Time..mins.,
+    MEMs_SampleInterval = MEMs..Sample.interval,
+    MEMs_SampleInterval_Mins = MEMs..Sample.interval.Decimal.Time..mins.,
+    Cortisol_ugdl = Cortisol..ug.dl.,
+    DHEA_pgdl = DHEA..pg.dl.,
+    Cortisol_nmolL = Cortisol..nmol.L.,
+    DHEA_nmolL = DHEA..nmol.L.,
+    DayNumber = DAYNUMB
+  )
+
+## DATE/TIME HANDLING
+# Function to parse time strings (handles hh:mm format)
+parse_time_hhmm <- function(time_str) {
+  # Return NA for empty strings or NA values
+  if (is.na(time_str) || time_str == "") {
+    return(NA)
+  }
+  # Parse hh:mm format
+  parsed <- hm(time_str)
+  return(parsed)
+}
+
+# Function to convert time string to minutes since midnight
+time_to_minutes <- function(time_str) {
+  if (is.na(time_str) || time_str == "") {
+    return(NA)
+  }
+  parts <- strsplit(time_str, ":")[[1]]
+  if (length(parts) >= 2) {
+    hours <- as.numeric(parts[1])
+    mins <- as.numeric(parts[2])
+    return(hours * 60 + mins)
+  }
+  return(NA)
+}
+
+# Apply time conversion to create minutes since midnight for clock times
+data <- data %>%
+  mutate(
+    # Convert clock times to minutes since midnight
+    Booklet_ClockTime_Mins = sapply(Booklet_ClockTime, time_to_minutes),
+    MEMs_ClockTime_Mins = sapply(MEMs_ClockTime, time_to_minutes),
+    WakeTime_Mins_Raw = sapply(SleepDiary_WakeTime, time_to_minutes)
+  )
+
+# Calculate time since waking
+data <- data %>%
+  mutate(
+    # Time since waking calculated from clock times minus wake time
+    Booklet_TimeSinceWaking = Booklet_ClockTime_Mins - WakeTime_Mins_Raw,
+    MEMs_TimeSinceWaking = MEMs_ClockTime_Mins - WakeTime_Mins_Raw
+  )
+
+
+
+data <- data %>%
+  group_by(SubjectID, DayNumber) %>%
+  mutate(
+    # Fill wake time: take the non-NA value from Sample 1 and apply to all samples
+    WakeTime_Mins = WakeTime_Mins_Raw[CollectionSample == 1][1]
+  ) %>%
+  ungroup()
+
+data <- data %>%
+  mutate(
+    # Time since waking calculated from clock times minus wake time
+    Booklet_TimeSinceWaking = Booklet_ClockTime_Mins - WakeTime_Mins,
+    MEMs_TimeSinceWaking = MEMs_ClockTime_Mins - WakeTime_Mins
+  )
+
+head(data)
+```
+
+```{r}
+
+# Flag/exclude implausible cortisol values
+# - Values > 80 nmol/L are lab errors (EXCLUDE)
+# - Values > 26 nmol/L are high but biologically possible (FLAG)
+data <- data %>%
+  mutate(
+    Cortisol_LabError = Cortisol_nmolL > 80,
+    Cortisol_High = Cortisol_nmolL > 26 & Cortisol_nmolL <= 80,
+    # Flag the extreme cortisol value (9999 appears to be an error code)
+    Cortisol_LabError = ifelse(Cortisol_nmolL > 1000, TRUE, Cortisol_LabError)
+  )
+
+# Flag DHEA at detection limit (5.205 nmol/L)
+data <- data %>%
+  mutate(
+    DHEA_AtDetectionLimit = abs(DHEA_nmolL - 5.205) < 0.001
+  )
+
+# Identify subjects with multiple DHEA at detection limit
+subjects_multiple_DHEA_limit <- data %>%
+  filter(DHEA_AtDetectionLimit) %>%
+  group_by(SubjectID) %>%
+  summarise(n_at_limit = n()) %>%
+  filter(n_at_limit > 1)
+
+
+data <- data %>%
+  mutate(
+    SubjectID_Factor = as.factor(SubjectID),
+    CollectionSample_Factor = factor(CollectionSample, 
+                                      levels = 1:4,
+                                      labels = c("Waking", "30 min", "Lunch", "10 hours")),
+    DayNumber_Factor = factor(DayNumber, levels = 1:3, labels = c("Day 1", "Day 2", "Day 3"))
+  )
+
+head(data)
+
+# Summary of missing data
+missing_summary <- data %>%
+  summarise(
+    Total_Observations = n(),
+    Missing_Booklet_ClockTime = sum(is.na(Booklet_ClockTime_Mins)),
+    Missing_MEMs_ClockTime = sum(is.na(MEMs_ClockTime_Mins)),
+    Missing_WakeTime = sum(is.na(WakeTime_Mins)),
+    Missing_Cortisol = sum(is.na(Cortisol_nmolL)),
+    Missing_DHEA = sum(is.na(DHEA_nmolL)),
+    Excluded_Cortisol_LabError = sum(Cortisol_LabError, na.rm = TRUE),
+    Excluded_DHEA_DetectionLimit = sum(DHEA_AtDetectionLimit, na.rm = TRUE)
+  )
+
+missing_summary_long <- missing_summary %>%
+  pivot_longer(cols = everything(), names_to = "Variable", values_to = "Count") %>%
+  mutate(Percentage = round(100 * Count / missing_summary$Total_Observations, 1))
+
+print(missing_summary_long)
+
+```
+
+
+```{r}
+# Table 1 EDA
+
+# Individual calculations
+mean(data$Booklet_TimeSinceWaking, na.rm = TRUE)
+sd(data$Booklet_TimeSinceWaking, na.rm = TRUE)
+
+mean(data$MEMs_TimeSinceWaking, na.rm = TRUE)
+sd(data$MEMs_TimeSinceWaking, na.rm = TRUE)
+
+mean(data$Cortisol_nmolL, na.rm = TRUE)
+sd(data$Cortisol_nmolL, na.rm = TRUE)
+
+mean(data$DHEA_nmolL, na.rm = TRUE)
+sd(data$DHEA_nmolL, na.rm = TRUE)
+
+# Or as one summary table
+data %>%
+  summarise(
+    Booklet_Mean = mean(Booklet_TimeSinceWaking, na.rm = TRUE),
+    Booklet_SD = sd(Booklet_TimeSinceWaking, na.rm = TRUE),
+    MEMs_Mean = mean(MEMs_TimeSinceWaking, na.rm = TRUE),
+    MEMs_SD = sd(MEMs_TimeSinceWaking, na.rm = TRUE),
+    Cortisol_Mean = mean(Cortisol_nmolL, na.rm = TRUE),
+    Cortisol_SD = sd(Cortisol_nmolL, na.rm = TRUE),
+    DHEA_Mean = mean(DHEA_nmolL, na.rm = TRUE),
+    DHEA_SD = sd(DHEA_nmolL, na.rm = TRUE)
+  )
+
+
+
+```
+
+
+```{r}
+# Q1 DESCRIPTIVE STATISTICS
+
+data_paired <- data %>%
+  filter(!is.na(Booklet_TimeSinceWaking) & !is.na(MEMs_TimeSinceWaking))
+
+data_paired <- data_paired %>%
+  mutate(
+    # Difference: Booklet - MEMs (positive = Booklet later than MEMs)
+    Time_Difference = Booklet_TimeSinceWaking - MEMs_TimeSinceWaking,
+    # Average of the two measurements (for Bland-Altman)
+    Time_Average = (Booklet_TimeSinceWaking + MEMs_TimeSinceWaking) / 2,
+    # Absolute difference
+    Abs_Difference = abs(Time_Difference)
+  )
+
+diff_summary_overall <- data_paired %>%
+  summarise(
+    N = n(),
+    Mean_Diff = mean(Time_Difference, na.rm = TRUE),
+    SD_Diff = sd(Time_Difference, na.rm = TRUE),
+    Median_Diff = median(Time_Difference, na.rm = TRUE),
+    IQR_Diff = IQR(Time_Difference, na.rm = TRUE),
+    Min_Diff = min(Time_Difference, na.rm = TRUE),
+    Max_Diff = max(Time_Difference, na.rm = TRUE),
+    Mean_Abs_Diff = mean(Abs_Difference, na.rm = TRUE)
+  )
+
+cat("--- Overall Time Difference (Booklet - MEMs, in minutes) ---\n")
+print(diff_summary_overall)
+
+# Calculate 95% Limits of Agreement
+mean_diff <- diff_summary_overall$Mean_Diff
+sd_diff <- diff_summary_overall$SD_Diff
+LoA_lower <- mean_diff - 1.96 * sd_diff
+LoA_upper <- mean_diff + 1.96 * sd_diff
+
+cat("\n--- Bland-Altman Statistics ---\n")
+cat("Mean Difference (Bias):", round(mean_diff, 2), "minutes\n")
+cat("95% Limits of Agreement:", round(LoA_lower, 2), "to", round(LoA_upper, 2), "minutes\n")
+
+# -----------------------------------------------------------------------------
+# 3.4 Summary by Collection Sample
+# -----------------------------------------------------------------------------
+diff_summary_by_sample <- data_paired %>%
+  group_by(CollectionSample_Factor) %>%
+  summarise(
+    N = n(),
+    Mean_Diff = round(mean(Time_Difference), 2),
+    SD_Diff = round(sd(Time_Difference), 2),
+    Median_Diff = round(median(Time_Difference), 2),
+    Min_Diff = round(min(Time_Difference), 2),
+    Max_Diff = round(max(Time_Difference), 2)
+  )
+
+cat("\n--- Time Difference by Collection Sample ---\n")
+print(diff_summary_by_sample)
+
+
+# -----------------------------------------------------------------------------
+# 3.5 Correlation between Booklet and MEMs times
+# -----------------------------------------------------------------------------
+correlation_test <- cor.test(data_paired$Booklet_TimeSinceWaking, 
+                              data_paired$MEMs_TimeSinceWaking,
+                              method = "pearson")
+
+cat("\n--- Pearson Correlation ---\n")
+cat("Correlation coefficient (r):", round(correlation_test$estimate, 4), "\n")
+cat("95% CI:", round(correlation_test$conf.int[1], 4), "to", 
+    round(correlation_test$conf.int[2], 4), "\n")
+cat("p-value:", format.pval(correlation_test$p.value, digits = 3), "\n")
+
+# -----------------------------------------------------------------------------
+# 3.6 VISUALIZATION: Scatterplot (per PI request)
+# -----------------------------------------------------------------------------
+plot_scatter_agreement <- ggplot(data_paired, 
+                                  aes(x = MEMs_TimeSinceWaking, 
+                                      y = Booklet_TimeSinceWaking)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red", linewidth = 1) +
+  geom_smooth(method = "lm", se = TRUE, color = "darkblue", linewidth = 0.8) +
+  labs(
+    title = "Agreement Between Booklet and MEMs Recording Times",
+    subtitle = paste0("Pearson r = ", round(correlation_test$estimate, 3),
+                      " (95% CI: ", round(correlation_test$conf.int[1], 3), 
+                      " to ", round(correlation_test$conf.int[2], 3), ")"),
+    x = "MEMs Time Since Waking (minutes)",
+    y = "Booklet Time Since Waking (minutes)"
+  ) +
+  annotate("text", x = max(data_paired$MEMs_TimeSinceWaking, na.rm = TRUE) * 0.2, 
+           y = max(data_paired$Booklet_TimeSinceWaking, na.rm = TRUE) * 0.9,
+           label = "Identity line (y = x)", color = "red", size = 3.5) +
+  coord_equal() +
+  theme(plot.subtitle = element_text(size = 10))
+
+print(plot_scatter_agreement)
+ggsave("Q1_scatterplot_agreement.png", plot_scatter_agreement, width = 8, height = 8, dpi = 150)
+
+
+```
+
+
+
+```{r}
+# Q1 Mixed model
+model_agreement <- lmer(Booklet_TimeSinceWaking ~ MEMs_TimeSinceWaking + (1|SubjectID), 
+                        data = data_paired)
+
+summary(model_agreement)
+
+```
+
+
+
+```{r}
+
+# Q2 
+
+# Define target times (in minutes since waking)
+TARGET_SAMPLE2 <- 30    # 30 minutes after waking
+TARGET_SAMPLE4 <- 600   # 600 minutes (10 hours) after waking
+
+# Filter to samples 2 and 4 only, and require MEMs time to be present
+data_adherence <- data %>%
+  filter(CollectionSample %in% c(2, 4)) %>%
+  filter(!is.na(Booklet_TimeSinceWaking)) %>%
+  mutate(
+    # Define target time based on sample
+    Target_Time = case_when(
+      CollectionSample == 2 ~ TARGET_SAMPLE2,
+      CollectionSample == 4 ~ TARGET_SAMPLE4
+    ),
+    # Calculate deviation from target
+    Deviation =Booklet_TimeSinceWaking - Target_Time,
+    Abs_Deviation = abs(Deviation),
+    # Adherence flags
+    Within_7.5min = Abs_Deviation <= 7.5,
+    Within_15min = Abs_Deviation <= 15,
+    # Label for reporting
+    Sample_Label = case_when(
+      CollectionSample == 2 ~ "+30 min",
+      CollectionSample == 4 ~ "+10 hours"
+    )
+  )
+
+
+# Function to calculate adherence with exact binomial CI
+calc_adherence <- function(data, sample_num, window_min) {
+  
+  subset_data <- data %>% filter(CollectionSample == sample_num)
+  n <- nrow(subset_data)
+  
+  if (window_min == 7.5) {
+    x <- sum(subset_data$Within_7.5min)
+  } else {
+    x <- sum(subset_data$Within_15min)
+  }
+  
+  # Exact binomial CI
+  ci <- binom.test(x, n, conf.level = 0.95)
+  
+  return(data.frame(
+    Sample = ifelse(sample_num == 2, "+30 min", "+10 hours"),
+    Target_Time = ifelse(sample_num == 2, "30 min", "600 min"),
+    Window = paste0("±", window_min, " min"),
+    N_Total = n,
+    N_Adherent = x,
+    Percentage = round(100 * x / n, 1),
+    CI_Lower = round(100 * ci$conf.int[1], 1),
+    CI_Upper = round(100 * ci$conf.int[2], 1)
+  ))
+}
+
+# Calculate for all combinations
+adherence_results <- bind_rows(
+  calc_adherence(data_adherence, 2, 7.5),
+  calc_adherence(data_adherence, 2, 15),
+  calc_adherence(data_adherence, 4, 7.5),
+  calc_adherence(data_adherence, 4, 15)
+)
+
+print(adherence_results)
+
+```
+
+```{r}
+# Q3
+
+# Find all observations at detection limit
+obs_at_limit <- data %>%
+  filter(DHEA_AtDetectionLimit) %>%
+  select(SubjectID, DayNumber, CollectionSample, DHEA_nmolL)
+
+print(obs_at_limit)
+
+# Data cleaning
+KNOT<-30
+
+data_Q3 <- data %>%
+  filter(!DHEA_AtDetectionLimit) %>%                    # Remove obs at detection limit
+  filter(SubjectID!=3037) %>%               # Remove subjects with multiple at limit
+  filter(!is.na(DHEA_nmolL)) %>%               # Remove missing DHEA
+  filter(Cortisol_nmolL<=80)    %>%                       # Remove extreme cortisol values
+  filter(!is.na(MEMs_TimeSinceWaking)) %>%              # Remove missing time
+  filter(MEMs_TimeSinceWaking>= 0) %>%
+  mutate(
+    Time = MEMs_TimeSinceWaking,
+    Time1 = pmin(Time, KNOT),
+    Time2 = pmax(Time - KNOT, 0),)
+
+
+# Model: Cortisol ~ Time1 + Time2 + (1|SubjectID)
+# 
+# Interpretation:
+# - Intercept: Expected cortisol at waking (Time = 0)
+# - Time1 coefficient: Rate of change from waking to 30 min (awakening response)
+# - Time2 coefficient: Rate of change after 30 min (decline phase)
+
+model_cortisol_pw <- lmer(
+  log(Cortisol_nmolL) ~ Time1 + Time2 + (1|SubjectID_Factor),
+  data = data_Q3
+)
+
+# without random intercept
+model_cortisol_pw2 <- lm(
+  Cortisol_nmolL ~ Time1 + Time2,
+  data = data_Q3
+)
+
+# compare models
+#AIC(model_cortisol_pw, model_cortisol_pw2)
+
+summary(model_cortisol_pw)
+
+
+
+# DHEA PW model with RI
+model_dhea_pw <- lmer(
+  log(DHEA_nmolL) ~ Time1 + Time2 + (1|SubjectID_Factor),
+  data = data_Q3
+)
+
+# DHEA PW MODEL WITHOUT RI
+model_dhea_pw2 <- lm(
+  DHEA_nmolL ~ Time1 + Time2,
+  data = data_Q3
+)
+
+AIC(model_dhea_pw, model_dhea_pw2)
+
+summary(model_dhea_pw)
+
+
+
+```
+
+
+```{r}
+# Q3 model diagnostics
+data_Q3 <- data_Q3 %>%
+  mutate(
+    Fitted_Cortisol = fitted(model_cortisol_pw),
+    Resid_Cortisol = residuals(model_cortisol_pw),
+    StdResid_Cortisol = residuals(model_cortisol_pw, type = "pearson"),
+    Fitted_DHEA = fitted(model_dhea_pw),
+    Resid_DHEA = residuals(model_dhea_pw),
+    StdResid_DHEA = residuals(model_dhea_pw, type = "pearson")
+  )
+
+p_cort_resid_fitted <- ggplot(data_Q3, aes(x = Fitted_Cortisol, y = Resid_Cortisol)) +
+  geom_point(alpha = 0.4, color = "steelblue") +
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+  geom_smooth(method = "loess", se = FALSE, color = "darkblue", linewidth = 0.8) +
+  labs(
+    title = "Cortisol: Residuals vs Fitted",
+    x = "Fitted Values",
+    y = "Residuals"
+  )
+
+
+
+
+p_cort_resid_fitted
+
+p_cort_qq <- ggplot(data_Q3, aes(sample = StdResid_Cortisol)) +
+  stat_qq(alpha = 0.4, color = "steelblue") +
+  stat_qq_line(color = "red", linewidth = 1) +
+  labs(
+    title = "Cortisol: Q-Q Plot",
+    x = "Theoretical Quantiles",
+    y = "Sample Quantiles"
+  )
+
+p_cort_qq
+
+
+cortisol_diagnostics <- grid.arrange(
+  p_cort_resid_fitted,
+  p_cort_qq,
+  ncol = 2,
+  top = "Cortisol Model Diagnostics"
+)
+
+
+p_dhea_resid_fitted <- ggplot(data_Q3, aes(x = Fitted_DHEA, y = Resid_DHEA)) +
+  geom_point(alpha = 0.4, color = "forestgreen") +
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+  geom_smooth(method = "loess", se = FALSE, color = "darkgreen", linewidth = 0.8) +
+  labs(
+    title = "DHEA: Residuals vs Fitted",
+    x = "Fitted Values",
+    y = "Residuals"
+  )
+
+p_dhea_qq <- ggplot(data_Q3, aes(sample = StdResid_DHEA)) +
+  stat_qq(alpha = 0.4, color = "forestgreen") +
+  stat_qq_line(color = "red", linewidth = 1) +
+  labs(
+    title = "DHEA: Q-Q Plot",
+    x = "Theoretical Quantiles",
+    y = "Sample Quantiles"
+  )
+
+dhea_diagnostics <- grid.arrange(
+  p_dhea_resid_fitted,
+  p_dhea_qq, 
+  ncol = 2,
+  top = "DHEA Model Diagnostics"
+)
+
+```
