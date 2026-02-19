@@ -1,0 +1,1729 @@
+---
+title: "proj1"
+author: "Qingyang Du"
+date: "2026-02-17"
+output: pdf_document
+---
+
+### notes from q&a
+
+keep all demographic confounders regardless of significance
+depression is not demographic
+
+race: non-hispanic white vs. others
+education: 4yrs of college and higher vs. below
+smoke group: smoker vs non or former smoker
+
+
+investigator expect cd4+ count to go up
+
+complete case analysis, consistent set of people for all 4 outcomes
+
+mediation on adherence? adjusted vs unadjusted for adherence
+
+interpretation: focus on bayesian (bayesian agrees with frequentist etc.)
+
+non-informative priors, 95% high posterior density interval
+
+Clinically meaningful difference:
+0.5log_10(vload)
+2pts on QoL
+50 CD4+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+
+library(tableone)
+library(naniar)       # Missing-data visualisation
+library(ggpubr)       # Publication-ready multi-panel figures
+library(corrplot)     # Correlation heatmap
+library(gridExtra)    # Arranging grids of plots
+library(scales)       # Axis formatting helpers
+```
+
+```{r}
+
+hiv_raw <- read.csv("C:/Users/rebec/OneDrive - The University of Colorado Denver/Courses/BIOS6624/Projects/Project 1/DataRaw/hiv_6624_final.csv", na.strings = c("", "NA", " "))
+
+# The first unnamed column is a row index from the CSV export; drop it
+hiv_raw <- hiv_raw %>% select(-1)
+
+# Quick inspection
+str(hiv_raw)
+dim(hiv_raw)       # Expect 3935 rows x 33 columns
+head(hiv_raw, 10)
+
+# Unique subjects
+length(unique(hiv_raw$newid))
+
+# Visit structure
+table(hiv_raw$years, useNA = "always")
+
+```
+
+
+```{r}
+# =============================================================================
+# 2.  RECODE VARIABLES
+# =============================================================================
+# Every recode below references the codebook (codebook_6624_hiv.pdf).
+# General conventions:
+#   - Sentinel values (9, -1, -9, 999) --> NA
+#   - Binary health conditions recoded to 0 / 1
+#   - Categorical variables converted to labelled factors
+#   - Continuous variables checked against plausible ranges
+# =============================================================================
+
+hiv_clean <- hiv_raw
+
+
+# ---------- 2.1  Comorbidity variables (multi-code binary) ------------------
+# Codebook pattern:  1=No, 2=Yes, 3=No (trajectory), 4=Yes (trajectory),
+#                    9=Insufficient data, -1=Improbable value
+# Applies to: HBP, DIAB, KID, DYSLIP
+# LIV34, FRP, FP use a subset (1=No, 2=Yes, 9=Insufficient)
+
+recode_comorbidity <- function(x) {
+  dplyr::case_when(
+    x %in% c(1, 3)  ~ 0L,        # No  (includes trajectory-based No)
+    x %in% c(2, 4)  ~ 1L,        # Yes (includes trajectory-based Yes)
+    x %in% c(9, -1) ~ NA_integer_,
+    TRUE             ~ NA_integer_
+  )
+}
+
+hiv_clean <- hiv_clean %>%
+  mutate(
+    HBP    = recode_comorbidity(HBP),
+    DIAB   = recode_comorbidity(DIAB),
+    KID    = recode_comorbidity(KID),
+    DYSLIP = recode_comorbidity(DYSLIP),
+    LIV34  = recode_comorbidity(LIV34),
+    FRP    = recode_comorbidity(FRP),
+    FP     = recode_comorbidity(FP)
+  )
+
+# ---------- 2.2  BMI --------------------------------------------------------
+# Codebook: 10.8 – 70.1 plausible; 999 = Insufficient data; -1 = Improbable
+# Extra safety: flag anything outside a generous 10 – 80 window.
+
+hiv_clean <- hiv_clean %>%
+  mutate(
+    BMI = ifelse(BMI %in% c(999, -1), NA_real_, BMI),
+    BMI = ifelse(!is.na(BMI) & (BMI < 10 | BMI > 80), NA_real_, BMI)
+  )
+
+
+# ---------- 2.3  CESD (Depression scale) ------------------------------------
+# Codebook: 0 – 60; -1 = Missing
+# Derive a binary depression indicator (>= 16 is depressed per standard cutoff)
+
+hiv_clean <- hiv_clean %>%
+  mutate(
+    CESD      = ifelse(CESD == -1, NA_integer_, CESD),
+    depressed = ifelse(!is.na(CESD), as.integer(CESD >= 16), NA_integer_)
+  )
+
+
+# ---------- 2.4  SMOKE (Smoking status) -------------------------------------
+# Codebook: 1 = Never smoked, 2 = Former smoker, 3 = Current smoker, Blank = Missing
+
+hiv_clean <- hiv_clean %>%
+  mutate(
+    SMOKE = factor(SMOKE,
+                   levels = c(1, 2, 3),
+                   labels = c("Never", "Former", "Current"))
+  )
+
+
+# ---------- 2.5  DKGRP (Alcohol use since last visit) -----------------------
+# Codebook: 0 = None, 1 = 1-3 drinks/wk, 2 = 4-13 drinks/wk,
+#           3 = >13 drinks/wk, Blank = Missing
+
+hiv_clean <- hiv_clean %>%
+  mutate(
+    DKGRP = factor(DKGRP,
+                   levels = c(0, 1, 2, 3),
+                   labels = c("None", "1-3/wk", "4-13/wk", ">13/wk"))
+  )
+
+
+# ---------- 2.6  HASHV (Marijuana use since last visit) ---------------------
+# Codebook: 1 = No, 2 = Yes, Blank = Missing
+# Recode to standard 0/1
+
+hiv_clean <- hiv_clean %>%
+  mutate(
+    HASHV = case_when(
+      HASHV == 1 ~ 0L,
+      HASHV == 2 ~ 1L,
+      TRUE       ~ NA_integer_
+    )
+  )
+
+
+# ---------- 2.7  HASHF (Marijuana frequency) --------------------------------
+# Codebook: 0 = Never, 1 = Daily, 2 = Weekly, 3 = Monthly, 4 = Less often,
+#           Blank = Missing
+# Convert to ordered factor
+
+hiv_clean <- hiv_clean %>%
+  mutate(
+    HASHF = factor(HASHF,
+                   levels = c(0, 1, 2, 3, 4),
+                   labels = c("Never", "Daily", "Weekly", "Monthly",
+                              "Less often"),
+                   ordered = TRUE)
+  )
+
+
+# ---------- 2.8  IDU (Injection drug use since last visit) ------------------
+# Codebook: 1 = No, 2 = Yes, Blank = Missing
+
+hiv_clean <- hiv_clean %>%
+  mutate(
+    IDU = case_when(
+      IDU == 1 ~ 0L,
+      IDU == 2 ~ 1L,
+      TRUE     ~ NA_integer_
+    )
+  )
+
+
+
+
+
+# ---------- 2.9  HEROPIATE (Heroin/opiate use since last visit) -------------
+# Codebook: 1 = No, 2 = Yes, -9 = Not specified, Blank = Missing
+
+hiv_clean <- hiv_clean %>%
+  mutate(
+    HEROPIATE = case_when(
+      HEROPIATE == 1  ~ 0L,
+      HEROPIATE == 2  ~ 1L,
+      HEROPIATE == -9 ~ NA_integer_,
+      TRUE            ~ NA_integer_
+    )
+  )
+
+
+# ---------- 2.10  RACE — UPDATED PER INVESTIGATOR --------------------------
+# Codebook: 1=White non-Hisp, 2=White Hisp, 3=Black non-Hisp, 4=Black Hisp,
+#           5=AI/AN, 6=Asian/PI, 7=Other, 8=Other Hisp, Blank=Missing
+#
+# Collapse to binary: Non-Hispanic White vs. Other
+
+hiv_clean <- hiv_clean %>%
+  mutate(
+    RACE_bin = case_when(
+      RACE == 1 ~ "Non-Hispanic White",
+      RACE %in% c(2, 3, 4, 5, 6, 7, 8) ~ "Other",
+      TRUE ~ NA_character_
+    ),
+    RACE_bin = factor(RACE_bin,
+                      levels = c("Non-Hispanic White", "Other"))
+  )
+
+
+# ---------- 2.11  EDUCBAS — UPDATED PER INVESTIGATOR -----------------------
+# Codebook: 1=<=8th, 2=9-11th, 3=12th, 4=Some college, 5=College degree,
+#           6=Some grad, 7=Post-graduate, Blank=Missing
+#
+# Collapse to binary: 4-year college or higher (5, 6, 7) vs. Below (1-4)
+
+hiv_clean <- hiv_clean %>%
+  mutate(
+    EDUC_bin = case_when(
+      EDUCBAS %in% c(5, 6, 7) ~ "College degree+",
+      EDUCBAS %in% c(1, 2, 3, 4) ~ "Below college degree",
+      TRUE ~ NA_character_
+    ),
+    EDUC_bin = factor(EDUC_bin,
+                      levels = c("Below college degree", "College degree+"))
+  )
+
+
+
+# ---------- 2.12  income (Individual gross income) --------------------------
+# Codebook: 1 = <$10k, 2 = $10-19k, 3 = $20-29k, 4 = $30-39k,
+#           5 = $40-49k, 6 = $50-59k, 7 = $60k+, 9 = Refuse, Blank = Missing
+#
+# Recode 9 -> NA and collapse into 3 brackets.
+
+hiv_clean <- hiv_clean %>%
+  mutate(
+    income = ifelse(income == 9, NA_real_, income),
+    income_cat = case_when(
+      income %in% c(1, 2)    ~ "<$20,000",
+      income %in% c(3, 4)    ~ "$20,000-$39,999",
+      income %in% c(5, 6, 7) ~ "$40,000+",
+      TRUE                    ~ NA_character_
+    ),
+    income_cat = factor(income_cat,
+                        levels = c("<$20,000",
+                                   "$20,000-$39,999",
+                                   "$40,000+"))
+  )
+
+
+# ---------- 2.13  ADH (ART adherence since last visit) ---------------------
+# Codebook: 1 = 100%, 2 = 95-99%, 3 = 75-94%, 4 = <75%, Blank = Missing
+# Convert to an ordered factor.
+
+hiv_clean <- hiv_clean %>%
+  mutate(
+    ADH_cat = case_when(
+      ADH == 1 ~ "100%",
+      ADH == 2 ~ "95-99%",
+      ADH == 3 ~ "75-94%",
+      ADH == 4 ~ "<75%",
+      TRUE     ~ NA_character_
+    ),
+    ADH_cat = factor(ADH_cat,
+                     levels = c("100%", "95-99%", "75-94%", "<75%"),
+                     ordered = TRUE)
+  )
+
+
+# ---------- 2.14  hard_drugs (Primary exposure) -----------------------------
+# Codebook: 0 = No, 1 = Yes, Blank = Missing
+# Convert to labelled factor.
+
+hiv_clean <- hiv_clean %>%
+  mutate(
+    hard_drugs = factor(hard_drugs,
+                        levels = c(0, 1),
+                        labels = c("No", "Yes"))
+  )
+
+
+# ---------- 2.15  hivpos, ART, everART --------------------------------------
+# Already coded 0/1 per codebook; convert to labelled factors for clarity.
+
+hiv_clean <- hiv_clean %>%
+  mutate(
+    hivpos  = factor(hivpos,  levels = c(0, 1), labels = c("Negative", "Positive")),
+    ART     = factor(ART,     levels = c(0, 1), labels = c("No", "Yes")),
+    everART = factor(everART, levels = c(0, 1), labels = c("No", "Yes"))
+  )
+```
+
+
+```{r}
+
+# =============================================================================
+# 3.  DERIVED VARIABLES
+# =============================================================================
+
+# ---------- 3.1  Log-transformed viral load ---------------------------------
+# VLOAD is heavily right-skewed with zeros (undetectable).
+# Use log10(VLOAD + 1) so that VLOAD = 0  -->  log10(1) = 0.
+
+hiv_clean <- hiv_clean %>%
+  mutate(
+    log_VLOAD = log10(VLOAD + 1)
+  )
+
+# ---------- 3.2  Undetectable viral load flag --------------------------------
+# Common clinical threshold for "undetectable" is < 50 copies/mL.
+
+hiv_clean <- hiv_clean %>%
+  mutate(
+    VLOAD_undetectable = ifelse(!is.na(VLOAD),
+                                as.integer(VLOAD < 50),
+                                NA_integer_)
+  )
+
+
+# =============================================================================
+# 4.  PLAUSIBLE-RANGE CHECKS ON CONTINUOUS VARIABLES
+# =============================================================================
+# Verify that values fall within ranges specified in the codebook.
+# Observations outside these ranges will be flagged; none are recoded here
+# so the analyst can review them before deciding on removal.
+
+range_check <- hiv_clean %>%
+  summarise(
+    VLOAD_min  = min(VLOAD,    na.rm = TRUE),
+    VLOAD_max  = max(VLOAD,    na.rm = TRUE),
+    LEU3N_min  = min(LEU3N,    na.rm = TRUE),
+    LEU3N_max  = max(LEU3N,    na.rm = TRUE),
+    AGG_PHYS_min = min(AGG_PHYS, na.rm = TRUE),
+    AGG_PHYS_max = max(AGG_PHYS, na.rm = TRUE),
+    AGG_MENT_min = min(AGG_MENT, na.rm = TRUE),
+    AGG_MENT_max = max(AGG_MENT, na.rm = TRUE),
+    BMI_min    = min(BMI,      na.rm = TRUE),
+    BMI_max    = max(BMI,      na.rm = TRUE),
+    CESD_min   = min(CESD,     na.rm = TRUE),
+    CESD_max   = max(CESD,     na.rm = TRUE),
+    TCHOL_min  = min(TCHOL,    na.rm = TRUE),
+    TCHOL_max  = max(TCHOL,    na.rm = TRUE),
+    TRIG_min   = min(TRIG,     na.rm = TRUE),
+    TRIG_max   = max(TRIG,     na.rm = TRUE),
+    LDL_min    = min(LDL,      na.rm = TRUE),
+    LDL_max    = max(LDL,      na.rm = TRUE),
+    age_min    = min(age,      na.rm = TRUE),
+    age_max    = max(age,      na.rm = TRUE)
+  )
+
+# Transpose for easier reading
+range_check_long <- range_check %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value")
+
+range_check_long
+
+```
+
+```{r}
+# =============================================================================
+# 5.  IDENTIFY BASELINE HARD DRUG USE (PRIMARY EXPOSURE)
+# =============================================================================
+# The research question compares subjects by hard_drugs at baseline (year 0).
+# Extract this subject-level exposure and merge it back to all visits.
+
+baseline_exposure <- hiv_clean %>%
+  filter(years == 0) %>%
+  select(newid, hard_drugs_bl = hard_drugs)
+
+# Check distribution of baseline exposure
+table(baseline_exposure$hard_drugs_bl, useNA = "always")
+
+# Merge onto the full longitudinal dataset
+hiv_clean <- hiv_clean %>%
+  left_join(baseline_exposure, by = "newid")
+
+
+```
+
+```{r}
+# =============================================================================
+# 6.  CONSTRUCT ANALYTIC DATASETS
+# =============================================================================
+
+# ---------- 6.1  Baseline dataset (year 0) ----------------------------------
+dat_bl <- hiv_clean %>%
+  filter(years == 0)
+
+# ---------- 6.2  Year 2 dataset ---------------------------------------------
+dat_yr2 <- hiv_clean %>%
+  filter(years == 2)
+
+# ---------- 6.3  Merged analysis dataset ------------------------------------
+# Year 2 outcomes linked to baseline covariates and exposure.
+# Suffix _bl identifies the baseline version of a variable.
+
+baseline_covariates <- dat_bl %>%
+  select(
+    newid,
+    # Exposure
+    hard_drugs_bl,
+    # Baseline outcomes (for change scores and adjustment)
+    VLOAD_bl      = VLOAD,
+    log_VLOAD_bl  = log_VLOAD,
+    LEU3N_bl      = LEU3N,
+    AGG_PHYS_bl   = AGG_PHYS,
+    AGG_MENT_bl   = AGG_MENT,
+    # Demographics (time-invariant or measured at baseline)
+    age_bl        = age,
+    RACE_cat_bl   = RACE_cat,
+    EDUC_cat_bl   = EDUC_cat,
+    income_cat_bl = income_cat,
+    # Health behaviors at baseline
+    BMI_bl        = BMI,
+    SMOKE_bl      = SMOKE,
+    DKGRP_bl      = DKGRP,
+    HASHV_bl      = HASHV,
+    CESD_bl       = CESD,
+    depressed_bl  = depressed,
+    # Comorbidities at baseline
+    HBP_bl        = HBP,
+    DIAB_bl       = DIAB,
+    LIV34_bl      = LIV34,
+    KID_bl        = KID,
+    DYSLIP_bl     = DYSLIP,
+    FRP_bl        = FRP,
+    FP_bl         = FP,
+    # Lipids at baseline
+    TCHOL_bl      = TCHOL,
+    TRIG_bl       = TRIG,
+    LDL_bl        = LDL
+  )
+
+dat_analysis <- dat_yr2 %>%
+  # Keep year-2 outcomes and a few time-varying variables at year 2
+  select(
+    newid,
+    # Outcomes at year 2
+    VLOAD, log_VLOAD, VLOAD_undetectable,
+    LEU3N,
+    AGG_PHYS, AGG_MENT,
+    # Potential mediator at year 2
+    ADH_cat,
+    # Time-varying covariates at year 2 (for descriptive purposes)
+    age, BMI, CESD, ART
+  ) %>%
+  left_join(baseline_covariates, by = "newid")
+
+
+# ---------- 6.4  Derive change scores (Year 2 – Baseline) -------------------
+dat_analysis <- dat_analysis %>%
+  mutate(
+    delta_VLOAD     = VLOAD     - VLOAD_bl,
+    delta_log_VLOAD = log_VLOAD - log_VLOAD_bl,
+    delta_LEU3N     = LEU3N     - LEU3N_bl,
+    delta_AGG_PHYS  = AGG_PHYS  - AGG_PHYS_bl,
+    delta_AGG_MENT  = AGG_MENT  - AGG_MENT_bl
+  )
+
+
+```
+
+
+```{r}
+# =============================================================================
+# 7.  MISSING DATA SUMMARY
+# =============================================================================
+
+# --- 7.1  Missingness in the baseline dataset --------------------------------
+miss_bl <- dat_bl %>%
+  summarise(across(everything(),
+                   ~ sum(is.na(.)),
+                   .names = "{.col}_n_miss")) %>%
+  pivot_longer(everything(),
+               names_to  = "variable",
+               values_to = "n_missing") %>%
+  mutate(
+    variable  = str_remove(variable, "_n_miss$"),
+    pct_missing = round(100 * n_missing / nrow(dat_bl), 1)
+  ) %>%
+  arrange(desc(pct_missing))
+
+miss_bl
+
+# --- 7.2  Missingness in the year 2 outcome variables ------------------------
+miss_yr2_outcomes <- dat_yr2 %>%
+  summarise(
+    VLOAD_miss    = sum(is.na(VLOAD)),
+    LEU3N_miss    = sum(is.na(LEU3N)),
+    AGG_PHYS_miss = sum(is.na(AGG_PHYS)),
+    AGG_MENT_miss = sum(is.na(AGG_MENT))
+  ) %>%
+  pivot_longer(everything(),
+               names_to  = "outcome",
+               values_to = "n_missing") %>%
+  mutate(
+    outcome     = str_remove(outcome, "_miss$"),
+    pct_missing = round(100 * n_missing / nrow(dat_yr2), 1)
+  )
+
+miss_yr2_outcomes
+
+# --- 7.3  Missingness in the merged analysis dataset -------------------------
+miss_analysis <- dat_analysis %>%
+  summarise(across(everything(),
+                   ~ sum(is.na(.)),
+                   .names = "{.col}_n_miss")) %>%
+  pivot_longer(everything(),
+               names_to  = "variable",
+               values_to = "n_missing") %>%
+  mutate(
+    variable    = str_remove(variable, "_n_miss$"),
+    pct_missing = round(100 * n_missing / nrow(dat_analysis), 1)
+  ) %>%
+  arrange(desc(pct_missing))
+
+miss_analysis
+
+```
+
+
+```{r}
+# =============================================================================
+# 8.  ATTRITION ACCOUNTING
+# =============================================================================
+# Document how many subjects are available at each stage.
+
+n_total_obs     <- nrow(hiv_raw)
+n_unique        <- length(unique(hiv_raw$newid))
+n_baseline      <- nrow(dat_bl)
+n_year2         <- nrow(dat_yr2)
+n_both          <- length(intersect(dat_bl$newid, dat_yr2$newid))
+n_lost          <- n_baseline - n_both
+
+# Exposure group sizes at baseline
+n_drugs_bl <- table(dat_bl$hard_drugs, useNA = "always")
+
+# Among those with both visits, exposure group sizes
+n_drugs_analysis <- table(dat_analysis$hard_drugs_bl, useNA = "always")
+
+attrition_summary <- tibble(
+  Stage = c("Total observations in raw data",
+            "Unique subjects",
+            "Subjects with baseline visit (year 0)",
+            "Subjects with year 2 visit",
+            "Subjects with both baseline and year 2",
+            "Subjects lost to follow-up by year 2"),
+  N     = c(n_total_obs, n_unique, n_baseline, n_year2, n_both, n_lost)
+)
+
+attrition_summary
+
+# Attrition by exposure group
+attrition_by_drug <- dat_bl %>%
+  mutate(retained_yr2 = as.integer(newid %in% dat_yr2$newid)) %>%
+  group_by(hard_drugs) %>%
+  summarise(
+    n_baseline    = n(),
+    n_retained    = sum(retained_yr2),
+    n_lost        = n_baseline - n_retained,
+    pct_lost      = round(100 * n_lost / n_baseline, 1),
+    .groups       = "drop"
+  )
+
+attrition_by_drug
+
+
+
+```
+
+```{r}
+# =============================================================================
+# 9.  FINAL VERIFICATION
+# =============================================================================
+
+# Confirm factor levels are correct
+sapply(hiv_clean %>% select(where(is.factor)), levels)
+
+# Confirm no sentinel values remain in recoded comorbidities
+hiv_clean %>%
+  select(HBP, DIAB, KID, DYSLIP, LIV34, FRP, FP) %>%
+  summarise(across(everything(), ~ paste(sort(unique(na.omit(.))),
+                                         collapse = ", ")))
+
+# Confirm analysis dataset dimensions
+dim(dat_bl)
+dim(dat_yr2)
+dim(dat_analysis)
+
+# Preview analysis dataset
+head(dat_analysis, 5)
+str(dat_analysis)
+
+
+save(hiv_clean, dat_bl, dat_yr2, dat_analysis,
+     file = "hiv_cleaned.RData")
+```
+
+
+
+
+```{r}
+load("hiv_cleaned.RData")
+
+# Objects: hiv_clean  (full longitudinal, recoded)
+#          dat_bl     (baseline, year 0)
+#          dat_yr2    (year 2)
+#          dat_analysis (year 2 outcomes + baseline covariates + change scores)
+
+
+# =============================================================================
+#
+#                              T A B L E S
+#
+# =============================================================================
+
+
+# =============================================================================
+# TABLE 1 — Baseline Characteristics by Hard Drug Use at Baseline
+# =============================================================================
+
+table1_vars <- c(
+  # Demographics
+  "age", "RACE_cat", "EDUC_cat", "income_cat",
+
+  # Health behaviours
+  "BMI", "SMOKE", "DKGRP", "HASHV",
+  # Mental health
+  "CESD", "depressed",
+  # Comorbidities
+  "HBP", "DIAB", "LIV34", "KID", "DYSLIP", "FRP", "FP",
+  # Baseline outcomes
+  "VLOAD", "log_VLOAD", "LEU3N", "AGG_PHYS", "AGG_MENT"
+)
+
+table1_cat <- c(
+  "RACE_cat", "EDUC_cat", "income_cat", "SMOKE", "DKGRP",
+  "HASHV", "depressed",
+  "HBP", "DIAB", "LIV34", "KID", "DYSLIP", "FRP", "FP"
+)
+
+# Variables to report as median [IQR] due to skewness
+table1_nonnorm <- c("VLOAD", "CESD")
+
+table1 <- CreateTableOne(
+  vars       = table1_vars,
+  strata     = "hard_drugs",
+  data       = dat_bl,
+  factorVars = table1_cat,
+  test       = TRUE,
+  smd        = TRUE
+)
+
+# Print with nonnormal formatting; showAllLevels for completeness
+print(table1,
+      nonnormal    = table1_nonnorm,
+      showAllLevels = TRUE,
+      smd          = TRUE,
+      printToggle  = FALSE) -> table1_print
+
+table1_print
+
+
+
+
+```
+
+```{r}
+# =============================================================================
+# TABLE 2 — Year 2 Outcomes by Baseline Hard Drug Use
+# =============================================================================
+
+table2_vars     <- c("VLOAD", "log_VLOAD", "VLOAD_undetectable",
+                     "LEU3N", "AGG_PHYS", "AGG_MENT")
+table2_cat      <- c("VLOAD_undetectable")
+table2_nonnorm  <- c("VLOAD")
+
+table2 <- CreateTableOne(
+  vars       = table2_vars,
+  strata     = "hard_drugs_bl",
+  data       = dat_analysis,
+  factorVars = table2_cat,
+  test       = TRUE
+)
+
+print(table2,
+      nonnormal     = table2_nonnorm,
+      showAllLevels = TRUE,
+      printToggle   = FALSE) -> table2_print
+
+table2_print
+
+```
+
+```{r}
+# =============================================================================
+# TABLE 3 — Missingness Summary (Baseline and Year 2)
+# =============================================================================
+
+# Baseline missingness
+miss_bl <- dat_bl %>%
+  select(all_of(table1_vars)) %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(),
+               names_to  = "Variable",
+               values_to = "N_Missing_BL") %>%
+  mutate(Pct_Missing_BL = round(100 * N_Missing_BL / nrow(dat_bl), 1))
+
+# Year 2 missingness (outcomes + key time-varying)
+yr2_miss_vars <- c("VLOAD", "log_VLOAD", "LEU3N", "AGG_PHYS", "AGG_MENT",
+                   "ADH_cat", "BMI", "CESD")
+
+miss_yr2 <- dat_yr2 %>%
+  select(any_of(yr2_miss_vars)) %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(),
+               names_to  = "Variable",
+               values_to = "N_Missing_Y2") %>%
+  mutate(Pct_Missing_Y2 = round(100 * N_Missing_Y2 / nrow(dat_yr2), 1))
+
+# Combined table
+table3 <- miss_bl %>%
+  full_join(miss_yr2, by = "Variable") %>%
+  arrange(desc(Pct_Missing_BL))
+
+table3
+
+```
+
+```{r}
+# =============================================================================
+# TABLE 4 — Attrition Analysis: Retained vs. Lost by Exposure Group
+# =============================================================================
+
+# Flag whether each baseline subject is retained at year 2
+dat_attrition <- dat_bl %>%
+  mutate(retained = factor(
+    ifelse(newid %in% dat_yr2$newid, "Retained", "Lost to follow-up"),
+    levels = c("Retained", "Lost to follow-up")
+  ))
+
+# Overall attrition counts
+table(dat_attrition$retained)
+
+# Attrition by hard drug use
+table(dat_attrition$hard_drugs, dat_attrition$retained)
+
+# Compare baseline characteristics between retained and lost subjects
+table4_vars <- c("age", "RACE_cat", "EDUC_cat", "income_cat", "BMI",
+                 "SMOKE", "DKGRP", "CESD", "depressed", "hard_drugs",
+                 "VLOAD", "log_VLOAD", "LEU3N", "AGG_PHYS", "AGG_MENT",
+                 "HBP", "DIAB", "LIV34", "KID", "DYSLIP")
+
+table4_cat <- c("RACE_cat", "EDUC_cat", "income_cat", "SMOKE", "DKGRP",
+                "depressed", "hard_drugs",
+                "HBP", "DIAB", "LIV34", "KID", "DYSLIP")
+
+table4 <- CreateTableOne(
+  vars       = table4_vars,
+  strata     = "retained",
+  data       = dat_attrition,
+  factorVars = table4_cat,
+  test       = TRUE,
+  smd        = TRUE
+)
+
+print(table4,
+      nonnormal     = c("VLOAD", "CESD"),
+      showAllLevels = TRUE,
+      smd           = TRUE,
+      printToggle   = FALSE) -> table4_print
+
+table4_print
+
+# Attrition stratified by exposure (hard drug users)
+table4_drugs <- CreateTableOne(
+  vars       = table4_vars[table4_vars != "hard_drugs"],
+  strata     = "retained",
+  data       = dat_attrition %>% filter(hard_drugs == "Yes"),
+  factorVars = table4_cat[table4_cat != "hard_drugs"],
+  test       = TRUE
+)
+
+print(table4_drugs,
+      nonnormal    = c("VLOAD", "CESD"),
+      showAllLevels = TRUE,
+      printToggle  = FALSE) -> table4_drugs_print
+
+table4_drugs_print
+
+# Attrition stratified by exposure (non-users)
+table4_nodrugs <- CreateTableOne(
+  vars       = table4_vars[table4_vars != "hard_drugs"],
+  strata     = "retained",
+  data       = dat_attrition %>% filter(hard_drugs == "No"),
+  factorVars = table4_cat[table4_cat != "hard_drugs"],
+  test       = TRUE
+)
+
+print(table4_nodrugs,
+      nonnormal    = c("VLOAD", "CESD"),
+      showAllLevels = TRUE,
+      printToggle  = FALSE) -> table4_nodrugs_print
+
+table4_nodrugs_print
+```
+
+```{r}
+
+# =============================================================================
+#
+#                             F I G U R E S
+#
+# =============================================================================
+
+# Colour palette for hard drug use groups
+cols_drug <- c("No" = "#2C7BB6", "Yes" = "#D7191C")
+
+
+# =============================================================================
+# FIGURE 1 — Sample Flow Diagram (text-based summary)
+# =============================================================================
+# A formal consort diagram would be generated in a reporting tool; here we
+# print the counts so they can be transcribed into a flow diagram.
+
+n_total_obs <- nrow(hiv_clean)
+n_unique    <- length(unique(hiv_clean$newid))
+n_bl        <- nrow(dat_bl)
+n_y2        <- nrow(dat_yr2)
+n_both      <- nrow(dat_analysis)
+n_lost      <- n_bl - n_both
+
+flow <- tibble(
+  Step = c("Total observations (all visits)",
+           "Unique subjects",
+           "Subjects at baseline (year 0)",
+           "  - Hard drug users at baseline",
+           "  - Non-users at baseline",
+           "  - Missing exposure at baseline",
+           "Subjects at year 2",
+           "Subjects with both BL & Y2 (analytic sample)",
+           "Lost to follow-up (BL present, Y2 absent)"),
+  N = c(n_total_obs,
+        n_unique,
+        n_bl,
+        sum(dat_bl$hard_drugs == "Yes", na.rm = TRUE),
+        sum(dat_bl$hard_drugs == "No",  na.rm = TRUE),
+        sum(is.na(dat_bl$hard_drugs)),
+        n_y2,
+        n_both,
+        n_lost)
+)
+
+flow
+
+```
+
+```{r}
+# =============================================================================
+# FIGURE 2 — Histograms / Density Plots of Outcomes at Baseline and Year 2
+# =============================================================================
+
+# Prepare long-format data for baseline and year 2
+outcomes_long <- bind_rows(
+  dat_bl  %>% select(newid, VLOAD, log_VLOAD, LEU3N, AGG_PHYS, AGG_MENT) %>%
+    mutate(Visit = "Baseline (Year 0)"),
+  dat_yr2 %>% select(newid, VLOAD, log_VLOAD, LEU3N, AGG_PHYS, AGG_MENT) %>%
+    mutate(Visit = "Year 2")
+) %>%
+  pivot_longer(cols = c(VLOAD, log_VLOAD, LEU3N, AGG_PHYS, AGG_MENT),
+               names_to  = "Outcome",
+               values_to = "Value")
+
+# Panel A: Raw VLOAD (truncate x-axis for readability)
+fig2a <- ggplot(outcomes_long %>% filter(Outcome == "VLOAD"),
+                aes(x = Value, fill = Visit)) +
+  geom_histogram(alpha = 0.5, position = "identity", bins = 50) +
+  coord_cartesian(xlim = c(0, 100000)) +
+  scale_fill_manual(values = c("Baseline (Year 0)" = "#E69F00",
+                               "Year 2" = "#56B4E9")) +
+  labs(title = "A. Viral Load (raw)", x = "VLOAD (copies/mL)", y = "Count") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+
+# Panel B: Log10 VLOAD
+fig2b <- ggplot(outcomes_long %>% filter(Outcome == "log_VLOAD"),
+                aes(x = Value, fill = Visit)) +
+  geom_density(alpha = 0.4) +
+  scale_fill_manual(values = c("Baseline (Year 0)" = "#E69F00",
+                               "Year 2" = "#56B4E9")) +
+  labs(title = expression("B. Log"[10]*"(VLOAD + 1)"),
+       x = expression("Log"[10]*"(VLOAD + 1)"), y = "Density") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+
+# Panel C: CD4 count
+fig2c <- ggplot(outcomes_long %>% filter(Outcome == "LEU3N"),
+                aes(x = Value, fill = Visit)) +
+  geom_density(alpha = 0.4) +
+  scale_fill_manual(values = c("Baseline (Year 0)" = "#E69F00",
+                               "Year 2" = "#56B4E9")) +
+  labs(title = "C. CD4+ T Cell Count", x = "LEU3N (cells)", y = "Density") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+
+# Panel D: AGG_PHYS
+fig2d <- ggplot(outcomes_long %>% filter(Outcome == "AGG_PHYS"),
+                aes(x = Value, fill = Visit)) +
+  geom_density(alpha = 0.4) +
+  scale_fill_manual(values = c("Baseline (Year 0)" = "#E69F00",
+                               "Year 2" = "#56B4E9")) +
+  labs(title = "D. Physical QoL (AGG_PHYS)", x = "Score", y = "Density") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+
+# Panel E: AGG_MENT
+fig2e <- ggplot(outcomes_long %>% filter(Outcome == "AGG_MENT"),
+                aes(x = Value, fill = Visit)) +
+  geom_density(alpha = 0.4) +
+  scale_fill_manual(values = c("Baseline (Year 0)" = "#E69F00",
+                               "Year 2" = "#56B4E9")) +
+  labs(title = "E. Mental QoL (AGG_MENT)", x = "Score", y = "Density") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+
+fig2 <- ggarrange(fig2a, fig2b, fig2c, fig2d, fig2e,
+                  ncol = 2, nrow = 3, common.legend = TRUE, legend = "bottom")
+annotate_figure(fig2,
+                top = text_grob("Figure 2: Outcome Distributions at Baseline vs. Year 2",
+                                face = "bold", size = 13))
+
+```
+
+```{r}
+# =============================================================================
+# FIGURE 3 — QQ Plots for Each Outcome
+# =============================================================================
+
+qq_plot <- function(data, var, title) {
+  ggplot(data, aes(sample = .data[[var]])) +
+    stat_qq(size = 0.8, alpha = 0.4, colour = "#2C7BB6") +
+    stat_qq_line(colour = "#D7191C", linewidth = 0.7) +
+    labs(title = title, x = "Theoretical Quantiles", y = "Sample Quantiles") +
+    theme_minimal(base_size = 10)
+}
+
+# Use year 2 data for the QQ assessment (modeling distribution)
+fig3a <- qq_plot(dat_yr2, "VLOAD",    "A. VLOAD (raw)")
+fig3b <- qq_plot(dat_yr2, "log_VLOAD", expression("B. Log"[10]*"(VLOAD+1)"))
+fig3c <- qq_plot(dat_yr2, "LEU3N",    "C. CD4+ T Cell Count")
+fig3d <- qq_plot(dat_yr2, "AGG_PHYS", "D. Physical QoL")
+fig3e <- qq_plot(dat_yr2, "AGG_MENT", "E. Mental QoL")
+
+fig3 <- ggarrange(fig3a, fig3b, fig3c, fig3d, fig3e,
+                  ncol = 2, nrow = 3)
+annotate_figure(fig3,
+                top = text_grob("Figure 3: QQ Plots of Year 2 Outcomes",
+                                face = "bold", size = 13))
+
+```
+
+```{r}
+# =============================================================================
+# FIGURE 4 — Boxplots / Violin Plots of Year 2 Outcomes by BL Hard Drug Use
+# =============================================================================
+
+violin_box <- function(data, yvar, ylab, title) {
+  ggplot(data %>% filter(!is.na(hard_drugs_bl)),
+         aes(x = hard_drugs_bl, y = .data[[yvar]], fill = hard_drugs_bl)) +
+    geom_violin(alpha = 0.3, width = 0.8) +
+    geom_boxplot(width = 0.15, outlier.size = 0.8, alpha = 0.7) +
+    scale_fill_manual(values = cols_drug) +
+    labs(title = title, x = "Baseline Hard Drug Use", y = ylab) +
+    theme_minimal(base_size = 10) +
+    theme(legend.position = "none")
+}
+
+fig4a <- violin_box(dat_analysis, "log_VLOAD",
+                    expression("Log"[10]*"(VLOAD+1)"),
+                    "A. Viral Load (log)")
+fig4b <- violin_box(dat_analysis, "LEU3N",
+                    "CD4+ Count (cells)",
+                    "B. CD4+ T Cell Count")
+fig4c <- violin_box(dat_analysis, "AGG_PHYS",
+                    "Score",
+                    "C. Physical QoL")
+fig4d <- violin_box(dat_analysis, "AGG_MENT",
+                    "Score",
+                    "D. Mental QoL")
+
+fig4 <- ggarrange(fig4a, fig4b, fig4c, fig4d, ncol = 2, nrow = 2)
+annotate_figure(fig4,
+                top = text_grob(
+                  "Figure 4: Year 2 Outcomes by Baseline Hard Drug Use",
+                  face = "bold", size = 13))
+
+```
+
+```{r}
+# =============================================================================
+# FIGURE 5 — Mean Longitudinal Trajectory Plots (Years 0–8) by Exposure
+# =============================================================================
+
+# Compute group means ± SE over all available visits
+traj_data <- hiv_clean %>%
+  filter(!is.na(hard_drugs_bl)) %>%
+  group_by(years, hard_drugs_bl) %>%
+  summarise(
+    mean_logVL   = mean(log_VLOAD, na.rm = TRUE),
+    se_logVL     = sd(log_VLOAD, na.rm = TRUE) / sqrt(sum(!is.na(log_VLOAD))),
+    mean_LEU3N   = mean(LEU3N, na.rm = TRUE),
+    se_LEU3N     = sd(LEU3N, na.rm = TRUE) / sqrt(sum(!is.na(LEU3N))),
+    mean_PHYS    = mean(AGG_PHYS, na.rm = TRUE),
+    se_PHYS      = sd(AGG_PHYS, na.rm = TRUE) / sqrt(sum(!is.na(AGG_PHYS))),
+    mean_MENT    = mean(AGG_MENT, na.rm = TRUE),
+    se_MENT      = sd(AGG_MENT, na.rm = TRUE) / sqrt(sum(!is.na(AGG_MENT))),
+    n            = n(),
+    .groups      = "drop"
+  )
+
+traj_plot <- function(data, mean_var, se_var, ylab, title) {
+  ggplot(data, aes(x = years, y = .data[[mean_var]],
+                   colour = hard_drugs_bl, group = hard_drugs_bl)) +
+    geom_line(linewidth = 0.9) +
+    geom_point(size = 2) +
+    geom_errorbar(aes(ymin = .data[[mean_var]] - 1.96 * .data[[se_var]],
+                      ymax = .data[[mean_var]] + 1.96 * .data[[se_var]]),
+                  width = 0.15) +
+    geom_vline(xintercept = 2, linetype = "dashed", colour = "grey50",
+               linewidth = 0.4) +
+    scale_colour_manual(values = cols_drug, name = "BL Hard Drug Use") +
+    scale_x_continuous(breaks = 0:8) +
+    labs(title = title, x = "Years Since Initiating HAART", y = ylab) +
+    theme_minimal(base_size = 10) +
+    theme(legend.position = "bottom")
+}
+
+fig5a <- traj_plot(traj_data, "mean_logVL", "se_logVL",
+                   expression("Mean Log"[10]*"(VLOAD+1)"),
+                   "A. Viral Load (log)")
+fig5b <- traj_plot(traj_data, "mean_LEU3N", "se_LEU3N",
+                   "Mean CD4+ Count",
+                   "B. CD4+ T Cell Count")
+fig5c <- traj_plot(traj_data, "mean_PHYS", "se_PHYS",
+                   "Mean Score",
+                   "C. Physical QoL (AGG_PHYS)")
+fig5d <- traj_plot(traj_data, "mean_MENT", "se_MENT",
+                   "Mean Score",
+                   "D. Mental QoL (AGG_MENT)")
+
+fig5 <- ggarrange(fig5a, fig5b, fig5c, fig5d,
+                  ncol = 2, nrow = 2, common.legend = TRUE, legend = "bottom")
+annotate_figure(fig5,
+                top = text_grob(
+                  "Figure 5: Mean Outcome Trajectories (Years 0-8) by BL Hard Drug Use",
+                  face = "bold", size = 13))
+
+# Also add sample-size annotation table for trajectories
+traj_n <- hiv_clean %>%
+  filter(!is.na(hard_drugs_bl)) %>%
+  group_by(years, hard_drugs_bl) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = hard_drugs_bl, values_from = n,
+              names_prefix = "n_drugs_")
+
+traj_n
+
+```
+
+```{r}
+# =============================================================================
+# FIGURE 5B — Median Viral Load Trajectory (more appropriate given skew)
+# =============================================================================
+
+traj_vload_med <- hiv_clean %>%
+  filter(!is.na(hard_drugs_bl)) %>%
+  group_by(years, hard_drugs_bl) %>%
+  summarise(
+    median_VL = median(VLOAD, na.rm = TRUE),
+    q25_VL    = quantile(VLOAD, 0.25, na.rm = TRUE),
+    q75_VL    = quantile(VLOAD, 0.75, na.rm = TRUE),
+    .groups   = "drop"
+  )
+
+fig5b_med <- ggplot(traj_vload_med,
+                    aes(x = years, y = median_VL,
+                        colour = hard_drugs_bl, fill = hard_drugs_bl)) +
+  geom_ribbon(aes(ymin = q25_VL, ymax = q75_VL), alpha = 0.15,
+              colour = NA) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  geom_vline(xintercept = 2, linetype = "dashed", colour = "grey50") +
+  scale_colour_manual(values = cols_drug, name = "BL Hard Drug Use") +
+  scale_fill_manual(values = cols_drug, guide = "none") +
+  scale_x_continuous(breaks = 0:8) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Figure 5B: Median Viral Load Trajectory with IQR",
+       x = "Years Since Initiating HAART",
+       y = "Median VLOAD (copies/mL)") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+
+fig5b_med
+```
+
+```{r}
+
+# =============================================================================
+# FIGURE 6 — Spaghetti Plots (Random Sample of Individuals)
+# =============================================================================
+
+set.seed(42)
+
+# Sample up to 50 subjects per exposure group for readability
+ids_no  <- dat_bl %>% filter(hard_drugs == "No")  %>% pull(newid) %>%
+  sample(min(50, length(.)))
+ids_yes <- dat_bl %>% filter(hard_drugs == "Yes") %>% pull(newid) %>%
+  sample(min(50, length(.)))
+ids_sample <- c(ids_no, ids_yes)
+
+spaghetti_data <- hiv_clean %>%
+  filter(newid %in% ids_sample, !is.na(hard_drugs_bl))
+
+spag_plot <- function(data, yvar, ylab, title) {
+  ggplot(data, aes(x = years, y = .data[[yvar]],
+                   group = newid, colour = hard_drugs_bl)) +
+    geom_line(alpha = 0.35, linewidth = 0.4) +
+    scale_colour_manual(values = cols_drug, name = "BL Hard Drug Use") +
+    scale_x_continuous(breaks = 0:8) +
+    labs(title = title, x = "Years Since HAART", y = ylab) +
+    theme_minimal(base_size = 10) +
+    theme(legend.position = "bottom")
+}
+
+fig6a <- spag_plot(spaghetti_data, "log_VLOAD",
+                   expression("Log"[10]*"(VLOAD+1)"),
+                   "A. Viral Load (log)")
+fig6b <- spag_plot(spaghetti_data, "LEU3N",
+                   "CD4+ Count",
+                   "B. CD4+ T Cell Count")
+fig6c <- spag_plot(spaghetti_data, "AGG_PHYS",
+                   "Score",
+                   "C. Physical QoL")
+fig6d <- spag_plot(spaghetti_data, "AGG_MENT",
+                   "Score",
+                   "D. Mental QoL")
+
+fig6 <- ggarrange(fig6a, fig6b, fig6c, fig6d,
+                  ncol = 2, nrow = 2, common.legend = TRUE, legend = "bottom")
+annotate_figure(fig6,
+                top = text_grob(
+                  "Figure 6: Individual Trajectories (n=100 random sample)",
+                  face = "bold", size = 13))
+
+```
+
+```{r}
+# =============================================================================
+# FIGURE 7 — Correlation Heatmap of Continuous Variables
+# =============================================================================
+
+# Use baseline data; select continuous variables relevant to the analysis
+cor_vars <- dat_bl %>%
+  select(age, BMI, CESD, VLOAD, log_VLOAD, LEU3N,
+         AGG_PHYS, AGG_MENT, TCHOL, TRIG, LDL)
+
+cor_matrix <- cor(cor_vars, use = "pairwise.complete.obs")
+
+corrplot(cor_matrix,
+         method   = "color",
+         type     = "upper",
+         order    = "hclust",
+         tl.col   = "black",
+         tl.cex   = 0.8,
+         addCoef.col = "black",
+         number.cex  = 0.6,
+         col      = colorRampPalette(c("#2C7BB6", "white", "#D7191C"))(200),
+         title    = "Figure 7: Correlation Matrix of Continuous Variables (Baseline)",
+         mar      = c(0, 0, 2, 0))
+
+```
+
+```{r}
+# =============================================================================
+# FIGURE 8 — Baseline vs. Year 2 Scatterplots by Exposure Group
+# =============================================================================
+
+scatter_bl_y2 <- function(data, x_var, y_var, xlab, ylab, title) {
+  ggplot(data %>% filter(!is.na(hard_drugs_bl)),
+         aes(x = .data[[x_var]], y = .data[[y_var]],
+             colour = hard_drugs_bl)) +
+    geom_point(alpha = 0.3, size = 1) +
+    geom_smooth(method = "lm", se = TRUE, linewidth = 0.8) +
+    scale_colour_manual(values = cols_drug, name = "BL Hard Drug Use") +
+    labs(title = title, x = xlab, y = ylab) +
+    theme_minimal(base_size = 10) +
+    theme(legend.position = "bottom")
+}
+
+fig8a <- scatter_bl_y2(dat_analysis, "log_VLOAD_bl", "log_VLOAD",
+                       "Baseline log10(VLOAD+1)", "Year 2 log10(VLOAD+1)",
+                       "A. Viral Load")
+fig8b <- scatter_bl_y2(dat_analysis, "LEU3N_bl", "LEU3N",
+                       "Baseline CD4+ Count", "Year 2 CD4+ Count",
+                       "B. CD4+ T Cell Count")
+fig8c <- scatter_bl_y2(dat_analysis, "AGG_PHYS_bl", "AGG_PHYS",
+                       "Baseline AGG_PHYS", "Year 2 AGG_PHYS",
+                       "C. Physical QoL")
+fig8d <- scatter_bl_y2(dat_analysis, "AGG_MENT_bl", "AGG_MENT",
+                       "Baseline AGG_MENT", "Year 2 AGG_MENT",
+                       "D. Mental QoL")
+
+fig8 <- ggarrange(fig8a, fig8b, fig8c, fig8d,
+                  ncol = 2, nrow = 2, common.legend = TRUE, legend = "bottom")
+annotate_figure(fig8,
+                top = text_grob(
+                  "Figure 8: Baseline vs. Year 2 Outcomes by BL Hard Drug Use",
+                  face = "bold", size = 13))
+
+# Report the actual correlations
+cor_bl_y2 <- dat_analysis %>%
+  filter(!is.na(hard_drugs_bl)) %>%
+  group_by(hard_drugs_bl) %>%
+  summarise(
+    r_logVL  = cor(log_VLOAD_bl, log_VLOAD, use = "complete.obs"),
+    r_LEU3N  = cor(LEU3N_bl,     LEU3N,     use = "complete.obs"),
+    r_PHYS   = cor(AGG_PHYS_bl,  AGG_PHYS,  use = "complete.obs"),
+    r_MENT   = cor(AGG_MENT_bl,  AGG_MENT,  use = "complete.obs"),
+    .groups  = "drop"
+  )
+
+cor_bl_y2
+```
+
+```{r}
+
+# =============================================================================
+# FIGURE 9 — Missing Data Pattern Plot
+# =============================================================================
+
+# Use the merged analysis dataset; show missingness for the key variables
+fig9_vars <- dat_analysis %>%
+  select(hard_drugs_bl, VLOAD, LEU3N, AGG_PHYS, AGG_MENT,
+         ADH_cat, BMI_bl, CESD_bl, income_cat_bl,
+         SMOKE_bl, DKGRP_bl, RACE_cat_bl, EDUC_cat_bl)
+
+# Upset plot of missingness patterns (from naniar)
+gg_miss_upset(fig9_vars, nsets = 10)
+
+# Percent missing by variable — bar chart
+fig9_bar <- gg_miss_var(fig9_vars, show_pct = TRUE) +
+  labs(title = "Figure 9: Percent Missing by Variable (Analytic Sample)") +
+  theme_minimal(base_size = 11)
+
+fig9_bar
+
+# Missingness in outcomes by exposure group
+miss_by_drug <- dat_analysis %>%
+  filter(!is.na(hard_drugs_bl)) %>%
+  group_by(hard_drugs_bl) %>%
+  summarise(
+    VLOAD_miss    = round(100 * mean(is.na(VLOAD)), 1),
+    LEU3N_miss    = round(100 * mean(is.na(LEU3N)), 1),
+    AGG_PHYS_miss = round(100 * mean(is.na(AGG_PHYS)), 1),
+    AGG_MENT_miss = round(100 * mean(is.na(AGG_MENT)), 1),
+    .groups       = "drop"
+  )
+
+miss_by_drug
+
+```
+
+```{r}
+# =============================================================================
+# FIGURE 10 — ART Adherence at Year 2 by Baseline Hard Drug Use
+# =============================================================================
+
+fig10 <- dat_analysis %>%
+  filter(!is.na(hard_drugs_bl), !is.na(ADH_cat)) %>%
+  ggplot(aes(x = ADH_cat, fill = hard_drugs_bl)) +
+  geom_bar(position = "dodge", alpha = 0.8) +
+  scale_fill_manual(values = cols_drug, name = "BL Hard Drug Use") +
+  labs(title = "Figure 10: ART Adherence at Year 2 by Baseline Hard Drug Use",
+       x = "Adherence Category", y = "Count") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+
+fig10
+
+# Proportional version
+fig10_prop <- dat_analysis %>%
+  filter(!is.na(hard_drugs_bl), !is.na(ADH_cat)) %>%
+  count(hard_drugs_bl, ADH_cat) %>%
+  group_by(hard_drugs_bl) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  ungroup() %>%
+  ggplot(aes(x = ADH_cat, y = pct, fill = hard_drugs_bl)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  scale_fill_manual(values = cols_drug, name = "BL Hard Drug Use") +
+  labs(title = "Figure 10B: ART Adherence at Year 2 (Proportions)",
+       x = "Adherence Category", y = "Percent within Group (%)") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+
+fig10_prop
+
+
+
+```
+
+
+
+```{r}
+# =============================================================================
+# A.  CHANGE SCORE DISTRIBUTIONS BY EXPOSURE GROUP
+# =============================================================================
+
+change_long <- dat_analysis %>%
+  filter(!is.na(hard_drugs_bl)) %>%
+  select(hard_drugs_bl, delta_log_VLOAD, delta_LEU3N,
+         delta_AGG_PHYS, delta_AGG_MENT) %>%
+  pivot_longer(-hard_drugs_bl,
+               names_to  = "Outcome",
+               values_to = "Change") %>%
+  mutate(
+    Outcome = recode(Outcome,
+                     delta_log_VLOAD = "Delta log10(VLOAD)",
+                     delta_LEU3N     = "Delta CD4+ Count",
+                     delta_AGG_PHYS  = "Delta Physical QoL",
+                     delta_AGG_MENT  = "Delta Mental QoL")
+  )
+
+fig_change <- ggplot(change_long, aes(x = Change, fill = hard_drugs_bl)) +
+  geom_density(alpha = 0.4) +
+  facet_wrap(~ Outcome, scales = "free", ncol = 2) +
+  scale_fill_manual(values = cols_drug, name = "BL Hard Drug Use") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  labs(title = "Change Scores (Year 2 - Baseline) by BL Hard Drug Use",
+       x = "Change from Baseline", y = "Density") +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "bottom")
+
+fig_change
+
+# Summary statistics for change scores by group
+change_summary <- dat_analysis %>%
+  filter(!is.na(hard_drugs_bl)) %>%
+  group_by(hard_drugs_bl) %>%
+  summarise(
+    across(c(delta_log_VLOAD, delta_LEU3N, delta_AGG_PHYS, delta_AGG_MENT),
+           list(mean = ~ mean(., na.rm = TRUE),
+                sd   = ~ sd(., na.rm = TRUE),
+                med  = ~ median(., na.rm = TRUE)),
+           .names = "{.col}_{.fn}"),
+    .groups = "drop"
+  )
+
+change_summary
+
+
+```
+
+
+```{r}
+# =============================================================================
+# B.  BIVARIATE: CONTINUOUS COVARIATES vs. YEAR 2 OUTCOMES (LOESS SMOOTHERS)
+# =============================================================================
+
+loess_plot <- function(data, xvar, yvar, xlab, ylab) {
+  ggplot(data %>% filter(!is.na(hard_drugs_bl)),
+         aes(x = .data[[xvar]], y = .data[[yvar]])) +
+    geom_point(alpha = 0.15, size = 0.8, colour = "grey50") +
+    geom_smooth(method = "loess", se = TRUE, colour = "#D7191C",
+                linewidth = 0.8) +
+    labs(x = xlab, y = ylab) +
+    theme_minimal(base_size = 9)
+}
+
+# Age vs outcomes
+fig_biv_age_a <- loess_plot(dat_analysis, "age_bl", "log_VLOAD",
+                            "Baseline Age", "Y2 log10(VLOAD+1)")
+fig_biv_age_b <- loess_plot(dat_analysis, "age_bl", "LEU3N",
+                            "Baseline Age", "Y2 CD4+ Count")
+fig_biv_age_c <- loess_plot(dat_analysis, "age_bl", "AGG_PHYS",
+                            "Baseline Age", "Y2 Physical QoL")
+fig_biv_age_d <- loess_plot(dat_analysis, "age_bl", "AGG_MENT",
+                            "Baseline Age", "Y2 Mental QoL")
+
+fig_biv_age <- ggarrange(fig_biv_age_a, fig_biv_age_b,
+                         fig_biv_age_c, fig_biv_age_d,
+                         ncol = 2, nrow = 2)
+annotate_figure(fig_biv_age,
+                top = text_grob("Baseline Age vs. Year 2 Outcomes",
+                                face = "bold", size = 12))
+
+# BMI vs outcomes
+fig_biv_bmi_a <- loess_plot(dat_analysis, "BMI_bl", "log_VLOAD",
+                            "Baseline BMI", "Y2 log10(VLOAD+1)")
+fig_biv_bmi_b <- loess_plot(dat_analysis, "BMI_bl", "LEU3N",
+                            "Baseline BMI", "Y2 CD4+ Count")
+fig_biv_bmi_c <- loess_plot(dat_analysis, "BMI_bl", "AGG_PHYS",
+                            "Baseline BMI", "Y2 Physical QoL")
+fig_biv_bmi_d <- loess_plot(dat_analysis, "BMI_bl", "AGG_MENT",
+                            "Baseline BMI", "Y2 Mental QoL")
+
+fig_biv_bmi <- ggarrange(fig_biv_bmi_a, fig_biv_bmi_b,
+                         fig_biv_bmi_c, fig_biv_bmi_d,
+                         ncol = 2, nrow = 2)
+annotate_figure(fig_biv_bmi,
+                top = text_grob("Baseline BMI vs. Year 2 Outcomes",
+                                face = "bold", size = 12))
+
+# CESD vs outcomes
+fig_biv_cesd_a <- loess_plot(dat_analysis, "CESD_bl", "log_VLOAD",
+                             "Baseline CESD", "Y2 log10(VLOAD+1)")
+fig_biv_cesd_b <- loess_plot(dat_analysis, "CESD_bl", "LEU3N",
+                             "Baseline CESD", "Y2 CD4+ Count")
+fig_biv_cesd_c <- loess_plot(dat_analysis, "CESD_bl", "AGG_PHYS",
+                             "Baseline CESD", "Y2 Physical QoL")
+fig_biv_cesd_d <- loess_plot(dat_analysis, "CESD_bl", "AGG_MENT",
+                             "Baseline CESD", "Y2 Mental QoL")
+
+fig_biv_cesd <- ggarrange(fig_biv_cesd_a, fig_biv_cesd_b,
+                          fig_biv_cesd_c, fig_biv_cesd_d,
+                          ncol = 2, nrow = 2)
+annotate_figure(fig_biv_cesd,
+                top = text_grob("Baseline CESD vs. Year 2 Outcomes",
+                                face = "bold", size = 12))
+
+
+
+```
+
+```{r}
+# =============================================================================
+# C.  BIVARIATE: CATEGORICAL COVARIATES vs. YEAR 2 OUTCOMES (BOXPLOTS)
+# =============================================================================
+
+cat_box <- function(data, xvar, yvar, xlab, ylab) {
+  ggplot(data %>% filter(!is.na(.data[[xvar]])),
+         aes(x = .data[[xvar]], y = .data[[yvar]],
+             fill = .data[[xvar]])) +
+    geom_boxplot(alpha = 0.6, outlier.size = 0.5) +
+    labs(x = xlab, y = ylab) +
+    theme_minimal(base_size = 9) +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 30, hjust = 1))
+}
+
+# Race vs outcomes
+fig_race_a <- cat_box(dat_analysis, "RACE_cat_bl", "log_VLOAD",
+                      "Race", "Y2 log10(VL)")
+fig_race_b <- cat_box(dat_analysis, "RACE_cat_bl", "LEU3N",
+                      "Race", "Y2 CD4+")
+fig_race_c <- cat_box(dat_analysis, "RACE_cat_bl", "AGG_PHYS",
+                      "Race", "Y2 Phys QoL")
+fig_race_d <- cat_box(dat_analysis, "RACE_cat_bl", "AGG_MENT",
+                      "Race", "Y2 Ment QoL")
+
+fig_race <- ggarrange(fig_race_a, fig_race_b, fig_race_c, fig_race_d,
+                      ncol = 2, nrow = 2)
+annotate_figure(fig_race,
+                top = text_grob("Race/Ethnicity vs. Year 2 Outcomes",
+                                face = "bold", size = 12))
+
+# Smoking vs outcomes
+fig_smoke_a <- cat_box(dat_analysis, "SMOKE_bl", "log_VLOAD",
+                       "Smoking", "Y2 log10(VL)")
+fig_smoke_b <- cat_box(dat_analysis, "SMOKE_bl", "LEU3N",
+                       "Smoking", "Y2 CD4+")
+fig_smoke_c <- cat_box(dat_analysis, "SMOKE_bl", "AGG_PHYS",
+                       "Smoking", "Y2 Phys QoL")
+fig_smoke_d <- cat_box(dat_analysis, "SMOKE_bl", "AGG_MENT",
+                       "Smoking", "Y2 Ment QoL")
+
+fig_smoke <- ggarrange(fig_smoke_a, fig_smoke_b, fig_smoke_c, fig_smoke_d,
+                       ncol = 2, nrow = 2)
+annotate_figure(fig_smoke,
+                top = text_grob("Smoking Status vs. Year 2 Outcomes",
+                                face = "bold", size = 12))
+
+# Education vs outcomes
+fig_educ_a <- cat_box(dat_analysis, "EDUC_cat_bl", "log_VLOAD",
+                      "Education", "Y2 log10(VL)")
+fig_educ_b <- cat_box(dat_analysis, "EDUC_cat_bl", "LEU3N",
+                      "Education", "Y2 CD4+")
+fig_educ_c <- cat_box(dat_analysis, "EDUC_cat_bl", "AGG_PHYS",
+                      "Education", "Y2 Phys QoL")
+fig_educ_d <- cat_box(dat_analysis, "EDUC_cat_bl", "AGG_MENT",
+                      "Education", "Y2 Ment QoL")
+
+fig_educ <- ggarrange(fig_educ_a, fig_educ_b, fig_educ_c, fig_educ_d,
+                      ncol = 2, nrow = 2)
+annotate_figure(fig_educ,
+                top = text_grob("Education vs. Year 2 Outcomes",
+                                face = "bold", size = 12))
+
+# Income vs outcomes
+fig_inc_a <- cat_box(dat_analysis, "income_cat_bl", "log_VLOAD",
+                     "Income", "Y2 log10(VL)")
+fig_inc_b <- cat_box(dat_analysis, "income_cat_bl", "LEU3N",
+                     "Income", "Y2 CD4+")
+fig_inc_c <- cat_box(dat_analysis, "income_cat_bl", "AGG_PHYS",
+                     "Income", "Y2 Phys QoL")
+fig_inc_d <- cat_box(dat_analysis, "income_cat_bl", "AGG_MENT",
+                     "Income", "Y2 Ment QoL")
+
+fig_inc <- ggarrange(fig_inc_a, fig_inc_b, fig_inc_c, fig_inc_d,
+                     ncol = 2, nrow = 2)
+annotate_figure(fig_inc,
+                top = text_grob("Income vs. Year 2 Outcomes",
+                                face = "bold", size = 12))
+
+# Alcohol use vs outcomes
+fig_alc_a <- cat_box(dat_analysis, "DKGRP_bl", "log_VLOAD",
+                     "Alcohol Use", "Y2 log10(VL)")
+fig_alc_b <- cat_box(dat_analysis, "DKGRP_bl", "LEU3N",
+                     "Alcohol Use", "Y2 CD4+")
+fig_alc_c <- cat_box(dat_analysis, "DKGRP_bl", "AGG_PHYS",
+                     "Alcohol Use", "Y2 Phys QoL")
+fig_alc_d <- cat_box(dat_analysis, "DKGRP_bl", "AGG_MENT",
+                     "Alcohol Use", "Y2 Ment QoL")
+
+fig_alc <- ggarrange(fig_alc_a, fig_alc_b, fig_alc_c, fig_alc_d,
+                     ncol = 2, nrow = 2)
+annotate_figure(fig_alc,
+                top = text_grob("Alcohol Use vs. Year 2 Outcomes",
+                                face = "bold", size = 12))
+
+
+
+```
+
+```{r}
+# =============================================================================
+# D.  PROPORTION WITH UNDETECTABLE VIRAL LOAD OVER TIME
+# =============================================================================
+
+prop_undetect <- hiv_clean %>%
+  filter(!is.na(hard_drugs_bl), !is.na(VLOAD_undetectable)) %>%
+  group_by(years, hard_drugs_bl) %>%
+  summarise(
+    n_total       = n(),
+    n_undetect    = sum(VLOAD_undetectable),
+    pct_undetect  = round(100 * n_undetect / n_total, 1),
+    .groups       = "drop"
+  )
+
+fig_undetect <- ggplot(prop_undetect,
+                       aes(x = years, y = pct_undetect,
+                           colour = hard_drugs_bl, group = hard_drugs_bl)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2.5) +
+  geom_vline(xintercept = 2, linetype = "dashed", colour = "grey50") +
+  scale_colour_manual(values = cols_drug, name = "BL Hard Drug Use") +
+  scale_x_continuous(breaks = 0:8) +
+  scale_y_continuous(limits = c(0, 100)) +
+  labs(title = "Proportion with Undetectable Viral Load (<50 copies/mL) Over Time",
+       x = "Years Since Initiating HAART",
+       y = "% Undetectable") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+
+fig_undetect
+
+prop_undetect
+
+
+```
+
+```{r}
+
+# =============================================================================
+# E.  OUTLIER IDENTIFICATION
+# =============================================================================
+
+# Identify observations beyond 1.5*IQR from quartiles for each year-2 outcome
+flag_outliers <- function(x) {
+  q <- quantile(x, c(0.25, 0.75), na.rm = TRUE)
+  iqr <- q[2] - q[1]
+  lower <- q[1] - 1.5 * iqr
+  upper <- q[2] + 1.5 * iqr
+  !is.na(x) & (x < lower | x > upper)
+}
+
+outlier_flags <- dat_analysis %>%
+  mutate(
+    out_logVL  = flag_outliers(log_VLOAD),
+    out_LEU3N  = flag_outliers(LEU3N),
+    out_PHYS   = flag_outliers(AGG_PHYS),
+    out_MENT   = flag_outliers(AGG_MENT)
+  )
+
+outlier_summary <- outlier_flags %>%
+  summarise(
+    logVL_n_outlier  = sum(out_logVL,  na.rm = TRUE),
+    LEU3N_n_outlier  = sum(out_LEU3N,  na.rm = TRUE),
+    PHYS_n_outlier   = sum(out_PHYS,   na.rm = TRUE),
+    MENT_n_outlier   = sum(out_MENT,   na.rm = TRUE),
+    logVL_pct  = round(100 * mean(out_logVL,  na.rm = TRUE), 1),
+    LEU3N_pct  = round(100 * mean(out_LEU3N,  na.rm = TRUE), 1),
+    PHYS_pct   = round(100 * mean(out_PHYS,   na.rm = TRUE), 1),
+    MENT_pct   = round(100 * mean(out_MENT,   na.rm = TRUE), 1)
+  )
+
+outlier_summary
+
+# Inspect the most extreme outliers
+extreme_obs <- outlier_flags %>%
+  filter(out_logVL | out_LEU3N | out_PHYS | out_MENT) %>%
+  select(newid, hard_drugs_bl,
+         log_VLOAD, LEU3N, AGG_PHYS, AGG_MENT,
+         out_logVL, out_LEU3N, out_PHYS, out_MENT) %>%
+  arrange(desc(LEU3N))
+
+head(extreme_obs, 20)
+
+
+```
+
+
+```{r}
+# =============================================================================
+# F.  INFORMAL MISSINGNESS-MECHANISM ASSESSMENT
+# =============================================================================
+# Test whether missingness in year 2 outcomes is predicted by observed
+# baseline characteristics.  This helps assess whether a complete-case
+# analysis is reasonable or whether multiple imputation may be needed.
+
+# Among all baseline subjects, flag whether each outcome is observed at year 2
+miss_mech <- dat_bl %>%
+  mutate(
+    has_yr2_VLOAD = as.integer(
+      newid %in% (dat_yr2 %>% filter(!is.na(VLOAD)) %>% pull(newid))
+    ),
+    has_yr2_LEU3N = as.integer(
+      newid %in% (dat_yr2 %>% filter(!is.na(LEU3N)) %>% pull(newid))
+    ),
+    has_yr2_PHYS = as.integer(
+      newid %in% (dat_yr2 %>% filter(!is.na(AGG_PHYS)) %>% pull(newid))
+    ),
+    has_yr2_MENT = as.integer(
+      newid %in% (dat_yr2 %>% filter(!is.na(AGG_MENT)) %>% pull(newid))
+    )
+  )
+
+# Logistic regressions: is missingness predicted by baseline characteristics?
+# (Using VLOAD at year 2 as the representative outcome)
+miss_model_vload <- glm(
+  has_yr2_VLOAD ~ age + RACE_cat + EDUC_cat + income_cat +
+    BMI + CESD + log_VLOAD + LEU3N + hard_drugs,
+  data   = miss_mech,
+  family = binomial
+)
+
+summary(miss_model_vload)
+
+# Repeat for LEU3N
+miss_model_leu3n <- glm(
+  has_yr2_LEU3N ~ age + RACE_cat + EDUC_cat + income_cat +
+    BMI + CESD + log_VLOAD + LEU3N + hard_drugs,
+  data   = miss_mech,
+  family = binomial
+)
+
+summary(miss_model_leu3n)
+
+
+
+```
+
+
+```{r}
+# =============================================================================
+# G.  ADHERENCE–OUTCOME ASSOCIATIONS (Descriptive)
+# =============================================================================
+# Adherence is a potential mediator; these summaries inform whether a
+# sensitivity analysis adjusting for adherence is warranted.
+
+adh_outcome <- dat_analysis %>%
+  filter(!is.na(ADH_cat)) %>%
+  group_by(ADH_cat) %>%
+  summarise(
+    n            = n(),
+    mean_logVL   = mean(log_VLOAD, na.rm = TRUE),
+    mean_LEU3N   = mean(LEU3N,     na.rm = TRUE),
+    mean_PHYS    = mean(AGG_PHYS,  na.rm = TRUE),
+    mean_MENT    = mean(AGG_MENT,  na.rm = TRUE),
+    .groups      = "drop"
+  )
+
+adh_outcome
+
+# Boxplots of outcomes by adherence category
+fig_adh_a <- cat_box(dat_analysis, "ADH_cat", "log_VLOAD",
+                     "Adherence", "Y2 log10(VL)")
+fig_adh_b <- cat_box(dat_analysis, "ADH_cat", "LEU3N",
+                     "Adherence", "Y2 CD4+")
+fig_adh_c <- cat_box(dat_analysis, "ADH_cat", "AGG_PHYS",
+                     "Adherence", "Y2 Phys QoL")
+fig_adh_d <- cat_box(dat_analysis, "ADH_cat", "AGG_MENT",
+                     "Adherence", "Y2 Ment QoL")
+
+fig_adh <- ggarrange(fig_adh_a, fig_adh_b, fig_adh_c, fig_adh_d,
+                     ncol = 2, nrow = 2)
+annotate_figure(fig_adh,
+                top = text_grob("ART Adherence vs. Year 2 Outcomes",
+                                face = "bold", size = 12))
+
+```
