@@ -58,12 +58,15 @@ outcomes <- list(
   list(name  = "delta_log_VLOAD",
        y     = "delta_log_VLOAD",
        label = "Change in Log10 Viral Load"),
+  
   list(name  = "delta_LEU3N",
        y     = "delta_LEU3N",
        label = "Change in CD4+ T Cell Count"),
+  
   list(name  = "delta_AGG_PHYS",
        y     = "delta_AGG_PHYS",
        label = "Change in Physical QoL"),
+  
   list(name  = "delta_AGG_MENT",
        y     = "delta_AGG_MENT",
        label = "Change in Mental QoL")
@@ -86,25 +89,26 @@ results_list <- list()
 
 for (o in outcomes) {
 
-  # Model 1: Unadjusted
-f1 <- make_formula(o$y, "hard_drugs_bl")
+  # --- Model 1: Unadjusted ---
+  f1 <- make_formula(o$y, "hard_drugs_bl")
+  m1 <- lm(f1, data = dat_cc)
 
-# Model 2: Adjusted (no baseline outcome — it's in the change score)
-f2 <- make_formula(o$y, c("hard_drugs_bl", confounders))
+  # --- Model 2: Adjusted ---
+  f2 <- make_formula(o$y, c("hard_drugs_bl", confounders))
+  m2 <- lm(f2, data = dat_cc)
 
-# Model 3: Adjusted + Adherence
-f3 <- make_formula(o$y, c("hard_drugs_bl", confounders, "ADH_cat"))
+  # --- Model 3: Adjusted + Adherence ---
+  f3 <- make_formula(o$y, c("hard_drugs_bl", confounders, "ADH_cat"))
+  m3 <- lm(f3, data = dat_cc)
 
   results_list[[o$name]] <- list(
-    unadj    = m1,
-    adj      = m2,
-    adj_adh  = m3,
-    label    = o$label,
-    y        = o$y,
-    y_bl     = o$y_bl
+    unadj   = m1,
+    adj     = m2,
+    adj_adh = m3,
+    label   = o$label,
+    y       = o$y
   )
 }
-
 
 # =============================================================================
 # 3.  MODEL SUMMARIES
@@ -252,8 +256,8 @@ normality_tests
 for (nm in names(results_list)) {
   r <- results_list[[nm]]
 
-  diag_data <- dat_cc %>%
-    filter(complete.cases(dat_cc[, c(r$y, r$y_bl, confounders)])) %>%
+diag_data <- dat_cc %>%
+    filter(complete.cases(dat_cc[, c(r$y, confounders)])) %>%
     mutate(
       fitted_vals = fitted(r$adj),
       residuals   = residuals(r$adj)

@@ -360,7 +360,9 @@ for (o in outcomes) {
   )
 }
 
+```
 
+```{r}
 # =============================================================================
 # 9.  EXTRACT HARD DRUG USE EFFECT ACROSS ALL MODELS
 # =============================================================================
@@ -390,41 +392,61 @@ bayes_drug_effects
 
 
 # =============================================================================
-# 10.  POSTERIOR PROBABILITY OF HYPOTHESIZED DIRECTION
+# 10.  POSTERIOR PROBABILITY OF CLINICALLY MEANINGFUL DIFFERENCE
 # =============================================================================
-# H1: hard drug users have WORSE outcomes at year 2:
-#   log_VLOAD: higher  → P(beta > 0)
-#   LEU3N:     lower   → P(beta < 0)
-#   AGG_PHYS:  lower   → P(beta < 0)
-#   AGG_MENT:  lower   → P(beta < 0)
+# Clinically meaningful differences (per investigator):
+#   log10(VLOAD): 0.5 log10 copies/mL
+#   CD4+ (LEU3N): 50 cells
+#   AGG_PHYS:     2 points
+#   AGG_MENT:     2 points
+#
+# For change scores, beta = difference in change between drug users vs non-users.
+# Worse outcomes for drug users means:
+#   delta_log_VLOAD:  less VL suppression → beta > 0   → clinically meaningful if beta > 0.5
+#   delta_LEU3N:      less CD4 recovery   → beta < 0   → clinically meaningful if beta < -50
+#   delta_AGG_PHYS:   less QoL gain       → beta < 0   → clinically meaningful if beta < -2
+#   delta_AGG_MENT:   less QoL gain       → beta < 0   → clinically meaningful if beta < -2
 
-hypothesis_direction <- c(
-  "log_VLOAD" = "greater",    # beta > 0 means higher viral load
-  "LEU3N"     = "less",       # beta < 0 means lower CD4
-  "AGG_PHYS"  = "less",       # beta < 0 means lower physical QoL
-  "AGG_MENT"  = "less"        # beta < 0 means lower mental QoL
+hypothesis_thresholds <- list(
+  "delta_log_VLOAD" = list(direction = "greater", threshold = 0.5,
+                           label = "P(beta > 0.5)"),
+  "delta_LEU3N"     = list(direction = "less",    threshold = -50,
+                           label = "P(beta < -50)"),
+  "delta_AGG_PHYS"  = list(direction = "less",    threshold = -2,
+                           label = "P(beta < -2)"),
+  "delta_AGG_MENT"  = list(direction = "less",    threshold = -2,
+                           label = "P(beta < -2)")
 )
 
 posterior_probs <- map_dfr(names(bayes_results), function(nm) {
   r <- bayes_results[[nm]]
-  direction <- hypothesis_direction[[nm]]
+  h <- hypothesis_thresholds[[nm]]
 
-  # Extract hard_drugs_bl draws from adjusted model
+  # Extract hard_drugs_bl posterior draws from the adjusted model
   draws_mat <- as_draws_matrix(r$fit_adj$draws())
   drug_col <- which(r$prep_adj$col_names == "hard_drugs_blYes")
   drug_draws <- as.numeric(draws_mat[, paste0("beta[", drug_col, "]")])
 
-  if (direction == "greater") {
-    prob <- mean(drug_draws > 0)
+  # P(effect in hypothesized direction) — any effect
+  if (h$direction == "greater") {
+    prob_direction <- mean(drug_draws > 0)
   } else {
-    prob <- mean(drug_draws < 0)
+    prob_direction <- mean(drug_draws < 0)
+  }
+
+  # P(effect exceeds clinically meaningful threshold)
+  if (h$direction == "greater") {
+    prob_clinical <- mean(drug_draws > h$threshold)
+  } else {
+    prob_clinical <- mean(drug_draws < h$threshold)
   }
 
   tibble(
-    Outcome    = r$label,
-    Direction  = ifelse(direction == "greater",
-                        "P(beta > 0)", "P(beta < 0)"),
-    Probability = round(prob, 4)
+    Outcome              = r$label,
+    P_direction          = round(prob_direction, 4),
+    Clinical_threshold   = h$threshold,
+    P_clinically_meaningful = round(prob_clinical, 4),
+    Threshold_label      = h$label
   )
 })
 
