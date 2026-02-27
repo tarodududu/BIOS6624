@@ -1,0 +1,468 @@
+---
+title: "Untitled"
+author: "Qingyang Du"
+date: "2026-02-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+
+###############################################################################
+#                   REPORT TABLES SCRIPT (kableExtra)
+#
+# Prereq: Run the following scripts first:
+#   01_data_cleaning_v3.R      → hiv_cleaned.RData (dat_cc)
+#   Frequentist-code.Rmd       → freq_results.RData
+#   Bayesian.Rmd               → bayes_results.RData
+#
+# Saved objects loaded:
+#   freq_results.RData:
+#     results_list      — named list of lm model objects
+#     drug_effects      — tibble (Outcome, Model, estimate, std.error,
+#                           statistic, p.value, conf.low, conf.high)
+#     mediation_compare — tibble (Outcome, est_adj, est_adj_adh,
+#                           change, pct_change)
+#     r2_table          — tibble of R² values across 3 model tiers
+#
+#   bayes_results.RData:
+#     bayes_results       — named list of fit objects, summaries, prep data
+#     bayes_drug_effects  — tibble (Outcome, Model, Estimate, Posterior_SD,
+#                             HPDI_2.5, HPDI_97.5, ESS, MCSE,
+#                             MCSE_pct_SD, MCSE_OK)
+#     posterior_probs     — tibble (Outcome, P_direction,
+#                             Clinical_threshold, P_clinically_meaningful,
+#                             Threshold_label)
+#     bayes_mediation     — tibble (Outcome, est_adj, est_adj_adh,
+#                             change, pct_change)
+#     fit_comparison      — tibble of DIC, WAIC, LOOIC per model
+#
+# Produces publication-ready tables for the final report:
+#   Table 2:  Frequentist — hard drug use effect (Adjusted models × 4 outcomes)
+#   Table 2b: Frequentist — all covariate effects (Adjusted model × 4 outcomes)
+#   Table 3:  Bayesian — posterior summary (2 models × 4 outcomes)
+#   Table 3b: Bayesian — all covariate effects (Adjusted model × 4 outcomes)
+#   Table 4:  Frequentist vs. Bayesian comparison (adjusted model)
+#   Table 5:  Mediation assessment (both frameworks)
+#
+# Note: Table 1 (baseline characteristics) is produced in
+#       03_table1_kableExtra.R
+###############################################################################
+
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(broom)
+
+load("freq_results.RData")
+load("bayes_results.RData")
+
+
+# =============================================================================
+# SHARED: Outcome display order
+# =============================================================================
+
+outcome_order <- c("Change in Log10 Viral Load",
+                   "Change in CD4+ T Cell Count",
+                   "Change in Physical QoL",
+                   "Change in Mental QoL")
+
+# Formatting helpers
+fmt_est_ci <- function(est, lo, hi, digits = 3) {
+  paste0(formatC(est, format = "f", digits = digits),
+         " (",
+         formatC(lo, format = "f", digits = digits),
+         ", ",
+         formatC(hi, format = "f", digits = digits),
+         ")")
+}
+
+fmt_pval <- function(p) {
+  ifelse(p < 0.001, "<0.001", formatC(p, format = "f", digits = 3))
+}
+
+
+# =============================================================================
+# TABLE 2:  FREQUENTIST RESULTS — HARD DRUG USE EFFECT (Adjusted Models Only)
+# =============================================================================
+# Source: drug_effects from freq_results.RData
+# Rows:  4 outcomes
+# Cols:  Adjusted, Adjusted + Adherence
+# Cells: Estimate (95% CI), p-value
+
+freq_table <- drug_effects %>%
+  filter(Model != "Unadjusted") %>%
+  mutate(
+    cell = paste0(
+      fmt_est_ci(estimate, conf.low, conf.high),
+      ", p=",
+      fmt_pval(p.value)
+    )
+  ) %>%
+  select(Outcome, Model, cell) %>%
+  pivot_wider(names_from = Model, values_from = cell) %>%
+  mutate(Outcome = factor(Outcome, levels = outcome_order)) %>%
+  arrange(Outcome) %>%
+  rename(
+    " "                    = Outcome,
+    "Adjusted"             = Adjusted,
+    "Adjusted + Adherence" = `Adjusted + Adherence`
+  )
+
+table2_kbl <- kbl(freq_table,
+                  format  = "html",
+                  align   = c("l", "c", "c"),
+                  caption = paste0("Table 2. Estimated Effect of Hard Drug Use on ",
+                                   "Change in Treatment Outcomes (Frequentist)"),
+                  escape  = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE,
+                font_size  = 13,
+                position   = "center") %>%
+  footnote(general = paste0(
+             "Values shown as estimate (95% CI), p-value. ",
+             "Outcomes are change scores (Year 2 minus Baseline). ",
+             "Adjusted: change ~ hard drug use + age + race + education + BMI + smoking. ",
+             "Adjusted + Adherence: Adjusted model + ART adherence category. ",
+             "Viral load modeled on the log10 scale. ",
+             "Reference group: no hard drug use."),
+           general_title = "Note: ",
+           footnote_as_chunk = TRUE)
+
+table2_kbl
+
+
+# =============================================================================
+# TABLE 2b: FREQUENTIST — ALL COVARIATE EFFECTS (Adjusted Model)
+# =============================================================================
+# Full coefficient table for the adjusted model across all 4 outcomes.
+# Source: results_list from freq_results.RData
+
+# Readable variable labels
+var_labels <- c(
+  "(Intercept)"            = "Intercept",
+  "hard_drugs_blYes"       = "Hard Drug Use (Yes vs. No)",
+  "age_bl"                 = "Age",
+  "RACE_bin_blOther"       = "Race (Other vs. Non-Hispanic White)",
+  "EDUC_bin_blCollege degree+" = "Education (College+ vs. Below)",
+  "BMI_bl"                 = "BMI",
+  "SMOKE_bin_blCurrent"    = "Smoking (Current vs. Non/Former)"
+)
+
+freq_covar_table <- map_dfr(names(results_list), function(nm) {
+  r <- results_list[[nm]]
+  tidy(r$adj, conf.int = TRUE) %>%
+    mutate(Outcome = r$label)
+}) %>%
+  mutate(
+    Variable = var_labels[term],
+    Variable = ifelse(is.na(Variable), term, Variable),
+    cell     = paste0(
+      fmt_est_ci(estimate, conf.low, conf.high),
+      ", p=",
+      fmt_pval(p.value)
+    ),
+    Outcome = factor(Outcome, levels = outcome_order)
+  ) %>%
+  select(Outcome, Variable, cell) %>%
+  pivot_wider(names_from = Outcome, values_from = cell)
+
+# Enforce variable display order (intercept first, then exposure, then confounders)
+var_display_order <- c("Intercept",
+                       "Hard Drug Use (Yes vs. No)",
+                       "Age",
+                       "Race (Other vs. Non-Hispanic White)",
+                       "Education (College+ vs. Below)",
+                       "BMI",
+                       "Smoking (Current vs. Non/Former)")
+
+freq_covar_table <- freq_covar_table %>%
+  mutate(Variable = factor(Variable, levels = var_display_order)) %>%
+  arrange(Variable) %>%
+  rename(" " = Variable)
+
+table2b_kbl <- kbl(freq_covar_table,
+                   format  = "html",
+                   align   = c("l", "c", "c", "c", "c"),
+                   caption = paste0("Table 2b. Frequentist Adjusted Model: ",
+                                    "All Covariate Effects Across Outcomes"),
+                   escape  = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE,
+                font_size  = 12,
+                position   = "center") %>%
+  footnote(general = paste0(
+             "Values shown as estimate (95% CI), p-value. ",
+             "Model: change ~ hard drug use + age + race + education + BMI + smoking. ",
+             "Outcomes are change scores (Year 2 minus Baseline). ",
+             "Viral load modeled on the log10 scale."),
+           general_title = "Note: ",
+           footnote_as_chunk = TRUE)
+
+table2b_kbl
+
+
+# =============================================================================
+# TABLE 3:  BAYESIAN RESULTS — POSTERIOR SUMMARY FOR HARD DRUG USE
+# =============================================================================
+# Source: bayes_drug_effects + posterior_probs from bayes_results.RData
+# Rows:  4 outcomes × 2 models
+# Cols:  Posterior Mean (95% HPDI), P(direction), P(clinically meaningful)
+
+# Merge posterior probabilities (from adjusted model) into drug effects
+bayes_tbl <- bayes_drug_effects %>%
+  left_join(
+    posterior_probs %>%
+      select(Outcome, P_direction, P_clinically_meaningful, Threshold_label),
+    by = "Outcome"
+  ) %>%
+  mutate(
+    Mean_HPDI = fmt_est_ci(Estimate, HPDI_2.5, HPDI_97.5),
+    P_dir_display    = formatC(P_direction, format = "f", digits = 3),
+    P_clin_display   = formatC(P_clinically_meaningful, format = "f", digits = 3),
+    Outcome = factor(Outcome, levels = outcome_order)
+  ) %>%
+  arrange(Outcome, Model) %>%
+  select(Outcome, Model, Mean_HPDI, P_dir_display, P_clin_display) %>%
+  rename(
+    " "                           = Outcome,
+    "Model"                       = Model,
+    "Posterior Mean (95% HPDI)"   = Mean_HPDI,
+    "P(Direction)"                = P_dir_display,
+    "P(Clinically Meaningful)"    = P_clin_display
+  )
+
+table3_kbl <- kbl(bayes_tbl,
+                  format  = "html",
+                  align   = c("l", "l", "c", "c", "c"),
+                  caption = paste0("Table 3. Estimated Effect of Hard Drug Use on ",
+                                   "Change in Treatment Outcomes (Bayesian)"),
+                  escape  = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE,
+                font_size  = 13,
+                position   = "center") %>%
+  pack_rows(outcome_order[1], 1, 2, bold = TRUE, italic = TRUE) %>%
+  pack_rows(outcome_order[2], 3, 4, bold = TRUE, italic = TRUE) %>%
+  pack_rows(outcome_order[3], 5, 6, bold = TRUE, italic = TRUE) %>%
+  pack_rows(outcome_order[4], 7, 8, bold = TRUE, italic = TRUE) %>%
+  footnote(general = paste0(
+             "Values shown as posterior mean (95% highest posterior density interval). ",
+             "P(Direction): posterior probability that hard drug use worsens the outcome ",
+             "(higher viral load or lower CD4+/QoL). ",
+             "P(Clinically Meaningful): posterior probability that the effect exceeds ",
+             "pre-specified thresholds (0.5 log10 VL, 50 CD4+ cells, 2 QoL points). ",
+             "Priors: Normal(0, SD(outcome)) on coefficients; ",
+             "half-Normal(0, 2*SD(outcome)) on sigma. ",
+             "Reference group: no hard drug use."),
+           general_title = "Note: ",
+           footnote_as_chunk = TRUE)
+
+table3_kbl
+
+
+# =============================================================================
+# TABLE 3b: BAYESIAN — ALL COVARIATE EFFECTS (Adjusted Model)
+# =============================================================================
+# Full posterior summary for all coefficients across 4 outcomes.
+# Source: bayes_results (summary_adj tables) from bayes_results.RData
+
+bayes_covar_table <- map_dfr(names(bayes_results), function(nm) {
+  r <- bayes_results[[nm]]
+  r$summary_adj %>%
+    filter(!is.na(Variable), Variable != "sigma") %>%
+    mutate(Outcome = r$label)
+}) %>%
+  mutate(
+    Variable_label = var_labels[Variable],
+    Variable = ifelse(is.na(Variable_label), Variable, Variable_label),
+    cell     = paste0(
+      formatC(Estimate, format = "f", digits = 3),
+      " (",
+      formatC(HPDI_2.5, format = "f", digits = 3),
+      ", ",
+      formatC(HPDI_97.5, format = "f", digits = 3),
+      ")"
+    ),
+    Outcome = factor(Outcome, levels = outcome_order)
+  ) %>%
+  select(Outcome, Variable, cell) %>%
+  pivot_wider(names_from = Outcome, values_from = cell)
+
+bayes_covar_table <- bayes_covar_table %>%
+  mutate(Variable = factor(Variable, levels = var_display_order)) %>%
+  arrange(Variable) %>%
+  rename(" " = Variable)
+
+table3b_kbl <- kbl(bayes_covar_table,
+                   format  = "html",
+                   align   = c("l", "c", "c", "c", "c"),
+                   caption = paste0("Table 3b. Bayesian Adjusted Model: ",
+                                    "All Covariate Effects Across Outcomes"),
+                   escape  = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE,
+                font_size  = 12,
+                position   = "center") %>%
+  footnote(general = paste0(
+             "Values shown as posterior mean (95% HPDI). ",
+             "Model: change ~ hard drug use + age + race + education + BMI + smoking. ",
+             "Outcomes are change scores (Year 2 minus Baseline). ",
+             "Viral load modeled on the log10 scale. ",
+             "Priors: Normal(0, SD(outcome)) on coefficients; ",
+             "half-Normal(0, 2*SD(outcome)) on sigma."),
+           general_title = "Note: ",
+           footnote_as_chunk = TRUE)
+
+table3b_kbl
+
+
+# =============================================================================
+# TABLE 4:  FREQUENTIST vs. BAYESIAN COMPARISON (Adjusted Model)
+# =============================================================================
+# Side-by-side point estimates, interval estimates, and inference
+
+# Frequentist adjusted model
+freq_adj <- drug_effects %>%
+  filter(Model == "Adjusted") %>%
+  mutate(
+    Freq_Est = formatC(estimate, format = "f", digits = 3),
+    Freq_CI  = paste0("(",
+                      formatC(conf.low, format = "f", digits = 3),
+                      ", ",
+                      formatC(conf.high, format = "f", digits = 3),
+                      ")"),
+    Freq_p   = fmt_pval(p.value),
+    Outcome  = factor(Outcome, levels = outcome_order)
+  ) %>%
+  arrange(Outcome) %>%
+  select(Outcome, Freq_Est, Freq_CI, Freq_p)
+
+# Bayesian adjusted model
+bayes_adj <- bayes_drug_effects %>%
+  filter(Model == "Adjusted") %>%
+  left_join(
+    posterior_probs %>% select(Outcome, P_direction),
+    by = "Outcome"
+  ) %>%
+  mutate(
+    Bayes_Est  = formatC(Estimate, format = "f", digits = 3),
+    Bayes_CrI  = paste0("(",
+                        formatC(HPDI_2.5, format = "f", digits = 3),
+                        ", ",
+                        formatC(HPDI_97.5, format = "f", digits = 3),
+                        ")"),
+    Bayes_Prob = formatC(P_direction, format = "f", digits = 3),
+    Outcome    = factor(Outcome, levels = outcome_order)
+  ) %>%
+  arrange(Outcome) %>%
+  select(Outcome, Bayes_Est, Bayes_CrI, Bayes_Prob)
+
+# Merge
+comparison_table <- freq_adj %>%
+  left_join(bayes_adj, by = "Outcome") %>%
+  mutate(Outcome = as.character(Outcome)) %>%
+  rename(
+    " "              = Outcome,
+    "Estimate"       = Freq_Est,
+    "95% CI"         = Freq_CI,
+    "p-value"        = Freq_p,
+    "Post. Mean"     = Bayes_Est,
+    "95% HPDI"       = Bayes_CrI,
+    "P(Direction)"   = Bayes_Prob
+  )
+
+table4_kbl <- kbl(comparison_table,
+                  format  = "html",
+                  align   = c("l", "c", "c", "c", "c", "c", "c"),
+                  caption = paste0("Table 4. Comparison of Frequentist and Bayesian ",
+                                   "Estimates for the Effect of Hard Drug Use ",
+                                   "(Adjusted Model)"),
+                  escape  = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE,
+                font_size  = 13,
+                position   = "center") %>%
+  add_header_above(c(" " = 1,
+                     "Frequentist" = 3,
+                     "Bayesian" = 3)) %>%
+  footnote(general = paste0(
+             "Adjusted model: change ~ hard drug use + age + race + ",
+             "education + BMI + smoking. ",
+             "Frequentist: OLS with 95% confidence interval. ",
+             "Bayesian: posterior mean with 95% highest posterior density interval. ",
+             "P(Direction): posterior probability of effect in hypothesized direction."),
+           general_title = "Note: ",
+           footnote_as_chunk = TRUE)
+
+table4_kbl
+
+
+# =============================================================================
+# TABLE 5:  MEDIATION ASSESSMENT — ADHERENCE
+# =============================================================================
+# Sources: mediation_compare (freq) and bayes_mediation (bayes)
+# Shows attenuation of hard drug use coefficient when adherence is added
+
+freq_med <- mediation_compare %>%
+  mutate(
+    Outcome      = factor(Outcome, levels = outcome_order),
+    Freq_Adj     = formatC(est_adj, format = "f", digits = 3),
+    Freq_Adj_Adh = formatC(est_adj_adh, format = "f", digits = 3),
+    Freq_Change  = paste0(formatC(pct_change, format = "f", digits = 1), "%")
+  ) %>%
+  arrange(Outcome) %>%
+  select(Outcome, Freq_Adj, Freq_Adj_Adh, Freq_Change)
+
+bayes_med <- bayes_mediation %>%
+  mutate(
+    Outcome       = factor(Outcome, levels = outcome_order),
+    Bayes_Adj     = formatC(est_adj, format = "f", digits = 3),
+    Bayes_Adj_Adh = formatC(est_adj_adh, format = "f", digits = 3),
+    Bayes_Change  = paste0(formatC(pct_change, format = "f", digits = 1), "%")
+  ) %>%
+  arrange(Outcome) %>%
+  select(Outcome, Bayes_Adj, Bayes_Adj_Adh, Bayes_Change)
+
+mediation_table <- freq_med %>%
+  left_join(bayes_med, by = "Outcome") %>%
+  mutate(Outcome = as.character(Outcome)) %>%
+  rename(
+    " "                    = Outcome,
+    "Adjusted"             = Freq_Adj,
+    "Adj + Adherence"      = Freq_Adj_Adh,
+    "% Change"             = Freq_Change,
+    "Adjusted "            = Bayes_Adj,
+    "Adj + Adherence "     = Bayes_Adj_Adh,
+    "% Change "            = Bayes_Change
+  )
+
+table5_kbl <- kbl(mediation_table,
+                  format  = "html",
+                  align   = c("l", "c", "c", "c", "c", "c", "c"),
+                  caption = paste0("Table 5. Mediation Assessment: Attenuation of ",
+                                   "Hard Drug Use Effect After Adding ART Adherence"),
+                  escape  = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE,
+                font_size  = 13,
+                position   = "center") %>%
+  add_header_above(c(" " = 1,
+                     "Frequentist" = 3,
+                     "Bayesian" = 3)) %>%
+  footnote(general = paste0(
+             "Values are the estimated coefficient for hard drug use (Yes vs. No). ",
+             "% Change = 100 * (Adj+Adherence - Adjusted) / Adjusted. ",
+             "Attenuation toward zero when adherence is added suggests partial ",
+             "mediation through treatment adherence."),
+           general_title = "Note: ",
+           footnote_as_chunk = TRUE)
+
+table5_kbl
+
+
+
+```

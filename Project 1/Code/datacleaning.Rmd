@@ -583,21 +583,9 @@ load("hiv_cleaned.RData")
 # 0.  DEFINE COMPLETE-CASE ANALYTIC SAMPLE
 # =============================================================================
 
-# Subjects with all 4 outcomes at year 2
-dat_cc <- dat_analysis %>%
-  filter(!is.na(VLOAD),
-         !is.na(LEU3N),
-         !is.na(AGG_PHYS),
-         !is.na(AGG_MENT))
 
-# Report what was dropped
-n_before  <- nrow(dat_analysis)
-n_after   <- nrow(dat_cc)
-n_dropped <- n_before - n_after
 
-message("Analytic sample before complete-case restriction: ", n_before)
-message("Analytic sample after  complete-case restriction: ", n_after)
-message("Subjects dropped due to missing outcome(s):       ", n_dropped)
+
 
 # Verify no missing outcomes remain
 sapply(dat_cc[, c("VLOAD", "LEU3N", "AGG_PHYS", "AGG_MENT")],
@@ -870,5 +858,287 @@ table1_kbl <- kbl(table1_df,
 table1_kbl
 
 save(dat_cc, file = "hiv_complete_case.RData")
+
+```
+
+
+
+```{r}
+
+###############################################################################
+#                     TABLE 1 SCRIPT (kableExtra) — Complete Case
+#
+# Prereq: Run 01_data_cleaning_v3.R first to produce hiv_cleaned.RData
+#
+# Variables included reflect the analytic model:
+#   Exposure:    hard_drugs_bl (baseline hard drug use)
+#   Confounders: age, race (binary), education (binary), BMI, smoking (binary)
+#   Mediator:    ADH_cat (adherence, categorical)
+#   Outcomes:    Change from baseline to year 2 in —
+#                  log10(VLOAD), LEU3N, AGG_PHYS, AGG_MENT
+#
+# Restricts to subjects with ALL 4 year-2 outcomes AND all 4 baseline
+# outcomes observed (complete-case analytic sample).
+###############################################################################
+
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+
+load("hiv_cleaned.RData")
+
+
+# =============================================================================
+# 0.  DEFINE COMPLETE-CASE ANALYTIC SAMPLE & COMPUTE CHANGE SCORES
+# =============================================================================
+# dat_cc should already exist from the cleaning script. If re-running
+# standalone, recreate it here:
+# dat_cc <- dat_analysis %>%
+#   filter(
+#     !is.na(VLOAD),    !is.na(LEU3N),    !is.na(AGG_PHYS),    !is.na(AGG_MENT),
+#     !is.na(VLOAD_bl), !is.na(LEU3N_bl), !is.na(AGG_PHYS_bl), !is.na(AGG_MENT_bl),
+#     !is.na(hard_drugs_bl),
+#     !is.na(age_bl), !is.na(RACE_bin_bl), !is.na(EDUC_bin_bl),
+#     !is.na(BMI_bl), !is.na(SMOKE_bin_bl),
+#     !is.na(ADH_cat)
+#   )
+
+# Compute change scores (Year 2 minus Baseline)
+dat_cc <- dat_cc %>%
+  mutate(
+    chg_log_VLOAD = log_VLOAD - log_VLOAD_bl,
+    chg_LEU3N     = LEU3N     - LEU3N_bl,
+    chg_AGG_PHYS  = AGG_PHYS  - AGG_PHYS_bl,
+    chg_AGG_MENT  = AGG_MENT  - AGG_MENT_bl
+  )
+
+# Verify no missing outcomes remain
+sapply(dat_cc[, c("chg_log_VLOAD", "chg_LEU3N", "chg_AGG_PHYS", "chg_AGG_MENT")],
+       function(x) sum(is.na(x)))
+
+# Exposure group sizes in the complete-case sample
+table(dat_cc$hard_drugs_bl, useNA = "always")
+
+
+# =============================================================================
+# 1.  HELPER FUNCTIONS
+# =============================================================================
+
+cont_row <- function(data, var, label, digits = 1) {
+  by_group <- data %>%
+    group_by(hard_drugs_bl) %>%
+    summarise(
+      mean_val = mean(.data[[var]], na.rm = TRUE),
+      sd_val   = sd(.data[[var]], na.rm = TRUE),
+      .groups  = "drop"
+    ) %>%
+    mutate(cell = paste0(formatC(mean_val, format = "f", digits = digits),
+                         " (",
+                         formatC(sd_val, format = "f", digits = digits),
+                         ")")) %>%
+    select(hard_drugs_bl, cell) %>%
+    pivot_wider(names_from = hard_drugs_bl, values_from = cell)
+
+  overall <- data %>%
+    summarise(
+      mean_val = mean(.data[[var]], na.rm = TRUE),
+      sd_val   = sd(.data[[var]], na.rm = TRUE)
+    ) %>%
+    mutate(cell = paste0(formatC(mean_val, format = "f", digits = digits),
+                         " (",
+                         formatC(sd_val, format = "f", digits = digits),
+                         ")")) %>%
+    pull(cell)
+
+  tibble(Variable = label, Overall = overall, No = by_group$No, Yes = by_group$Yes)
+}
+
+cont_row_median <- function(data, var, label, digits = 1) {
+  med_iqr <- function(x) {
+    x <- x[!is.na(x)]
+    paste0(formatC(median(x), format = "f", digits = digits),
+           " [",
+           formatC(quantile(x, 0.25), format = "f", digits = digits),
+           ", ",
+           formatC(quantile(x, 0.75), format = "f", digits = digits),
+           "]")
+  }
+
+  by_group <- data %>%
+    group_by(hard_drugs_bl) %>%
+    summarise(cell = med_iqr(.data[[var]]), .groups = "drop") %>%
+    pivot_wider(names_from = hard_drugs_bl, values_from = cell)
+
+  tibble(Variable = label, Overall = med_iqr(data[[var]]),
+         No = by_group$No, Yes = by_group$Yes)
+}
+
+cat_rows <- function(data, var, label, level_labels = NULL) {
+  data <- data %>% filter(!is.na(.data[[var]]))
+  lvls <- if (!is.null(level_labels)) names(level_labels) else levels(factor(data[[var]]))
+
+  rows <- map_dfr(lvls, function(lv) {
+    display_label <- if (!is.null(level_labels)) level_labels[[lv]] else lv
+
+    n_all   <- sum(data[[var]] == lv, na.rm = TRUE)
+    pct_all <- 100 * n_all / nrow(data)
+    overall_cell <- paste0(n_all, " (", formatC(pct_all, format = "f", digits = 1), ")")
+
+    by_grp <- data %>%
+      group_by(hard_drugs_bl) %>%
+      summarise(
+        n_lev = sum(.data[[var]] == lv, na.rm = TRUE),
+        n_tot = n(),
+        .groups = "drop"
+      ) %>%
+      mutate(cell = paste0(n_lev, " (",
+                           formatC(100 * n_lev / n_tot, format = "f", digits = 1),
+                           ")")) %>%
+      select(hard_drugs_bl, cell) %>%
+      pivot_wider(names_from = hard_drugs_bl, values_from = cell)
+
+    tibble(Variable = paste0("    ", display_label),
+           Overall = overall_cell, No = by_grp$No, Yes = by_grp$Yes)
+  })
+
+  header <- tibble(Variable = label, Overall = "", No = "", Yes = "")
+  bind_rows(header, rows)
+}
+
+binary_row <- function(data, var, label, yes_val = 1) {
+  data <- data %>% filter(!is.na(.data[[var]]))
+
+  n_all   <- sum(data[[var]] == yes_val, na.rm = TRUE)
+  pct_all <- 100 * n_all / nrow(data)
+  overall_cell <- paste0(n_all, " (", formatC(pct_all, format = "f", digits = 1), ")")
+
+  by_grp <- data %>%
+    group_by(hard_drugs_bl) %>%
+    summarise(
+      n_lev = sum(.data[[var]] == yes_val, na.rm = TRUE),
+      n_tot = n(),
+      .groups = "drop"
+    ) %>%
+    mutate(cell = paste0(n_lev, " (",
+                         formatC(100 * n_lev / n_tot, format = "f", digits = 1),
+                         ")")) %>%
+    select(hard_drugs_bl, cell) %>%
+    pivot_wider(names_from = hard_drugs_bl, values_from = cell)
+
+  tibble(Variable = label, Overall = overall_cell, No = by_grp$No, Yes = by_grp$Yes)
+}
+
+
+# =============================================================================
+# 2.  BUILD TABLE 1 FROM COMPLETE-CASE SAMPLE
+# =============================================================================
+
+n_total <- nrow(dat_cc)
+n_no    <- sum(dat_cc$hard_drugs_bl == "No",  na.rm = TRUE)
+n_yes   <- sum(dat_cc$hard_drugs_bl == "Yes", na.rm = TRUE)
+
+n_row <- tibble(
+  Variable = "n",
+  Overall  = as.character(n_total),
+  No       = as.character(n_no),
+  Yes      = as.character(n_yes)
+)
+
+# --- Confounders (all baseline) ---
+age_row  <- cont_row(dat_cc, "age_bl", "Age, mean (SD)")
+
+race_row <- cat_rows(dat_cc, "RACE_bin_bl", "Race, n (%)",
+                     level_labels = c("Non-Hispanic White" = "Non-Hispanic White",
+                                      "Other" = "Other"))
+
+educ_row <- cat_rows(dat_cc, "EDUC_bin_bl", "Education, n (%)",
+                     level_labels = c("Below college degree" = "Below college degree",
+                                      "College degree+" = "College degree+"))
+
+bmi_row  <- cont_row(dat_cc, "BMI_bl", "BMI, mean (SD)")
+
+smoke_row <- cat_rows(dat_cc, "SMOKE_bin_bl", "Smoking, n (%)",
+                      level_labels = c("Non/Former" = "Non/Former",
+                                       "Current" = "Current"))
+
+# --- Mediator (adherence) ---
+adh_row <- cat_rows(dat_cc, "ADH_cat", "ART Adherence, n (%)",
+                    level_labels = c("100%"   = "100%",
+                                     "95-99%" = "95-99%",
+                                     "75-94%" = "75-94%",
+                                     "<75%"   = "<75%"))
+
+# --- Outcomes: Change from Baseline to Year 2 (Y2 - BL) ---
+chg_logvload_row <- cont_row(dat_cc, "chg_log_VLOAD",
+                             "\u0394 Log10(viral load), mean (SD)", digits = 2)
+chg_leu3n_row    <- cont_row(dat_cc, "chg_LEU3N",
+                             "\u0394 CD4+ T cell count (cells/\u00B5L), mean (SD)",
+                             digits = 1)
+chg_phys_row     <- cont_row(dat_cc, "chg_AGG_PHYS",
+                             "\u0394 Physical QoL (AGG_PHYS), mean (SD)", digits = 1)
+chg_ment_row     <- cont_row(dat_cc, "chg_AGG_MENT",
+                             "\u0394 Mental QoL (AGG_MENT), mean (SD)", digits = 1)
+
+
+# =============================================================================
+# 3.  ASSEMBLE
+# =============================================================================
+
+table1_df <- bind_rows(
+  n_row,
+  age_row,
+  race_row,
+  educ_row,
+  bmi_row,
+  smoke_row,
+  adh_row,
+  chg_logvload_row,
+  chg_leu3n_row,
+  chg_phys_row,
+  chg_ment_row
+)
+
+colnames(table1_df) <- c(
+  "",
+  paste0("Overall (N=", n_total, ")"),
+  paste0("No Hard Drug Use (N=", n_no, ")"),
+  paste0("Hard Drug Use (N=", n_yes, ")")
+)
+
+
+# =============================================================================
+# 4.  RENDER AS HTML (kableExtra)
+# =============================================================================
+
+table1_kbl <- kbl(table1_df,
+                  format    = "html",
+                  align     = c("l", "c", "c", "c"),
+                  caption   = paste0("Table 1. Baseline Characteristics and Outcome ",
+                                     "Changes by Hard Drug Use (Complete-Case Sample)"),
+                  escape    = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE,
+                font_size  = 13,
+                position   = "center") %>%
+  pack_rows("Confounders", 2, 12, bold = TRUE, italic = TRUE,
+            hline_before = TRUE) %>%
+  pack_rows("Mediator", 13, 17, bold = TRUE, italic = TRUE,
+            hline_before = TRUE) %>%
+  pack_rows("Outcomes (Change from Baseline to Year 2)", 18, 21,
+            bold = TRUE, italic = TRUE, hline_before = TRUE) %>%
+  footnote(general = paste0(
+             "Complete-case sample: restricted to subjects with all 4 outcomes ",
+             "observed at both baseline and year 2, non-missing exposure and ",
+             "confounders (N=", n_total, "). ",
+             "Confounders (age, race, education, BMI, smoking) retained ",
+             "regardless of significance per investigator specification. ",
+             "Adherence is the sole mediator. ",
+             "Outcome changes computed as Year 2 minus Baseline. ",
+             "Continuous variables reported as mean (SD). ",
+             "Categorical variables reported as n (%)."),
+           general_title = "Note: ",
+           footnote_as_chunk = TRUE)
+
+table1_kbl
 
 ```
