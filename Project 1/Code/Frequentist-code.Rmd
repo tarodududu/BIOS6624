@@ -1,0 +1,327 @@
+---
+title: "Untitled"
+author: "Qingyang Du"
+date: "2026-02-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Adherence: Outcome ~ Hard drug + ADH + other Covariates for both frequentist and bayesian
+Only descriptive for Hard drug ~ ADH
+
+
+```{r}
+###############################################################################
+#                   FREQUENTIST ANALYSIS SCRIPT
+#
+# Project:  Treatment Response to HAART and Hard Drug Use
+# Prereq:   Run 01_data_cleaning_v3.R, then 03_table1_kableExtra.R
+#           (the latter saves hiv_complete_case.RData with dat_cc)
+#
+# Models (for each of the 4 outcomes):
+#   Model 1: Unadjusted — Y2 outcome ~ hard_drugs_bl
+#   Model 2: Adjusted   — Y2 outcome ~ hard_drugs_bl + baseline outcome
+#                          + age + race + education + BMI + smoking
+#   Model 3: Adjusted + Adherence — Model 2 + ADH_cat
+#            (to assess whether adherence mediates the drug use effect)
+#
+# Confounders per investigator: age, race, education, BMI, smoking
+# (all retained regardless of significance)
+###############################################################################
+
+
+# =============================================================================
+# 0.  LOAD PACKAGES AND DATA
+# =============================================================================
+
+library(tidyverse)
+library(broom)        # tidy() for model summaries
+library(car)          # vif() for multicollinearity
+
+load("hiv_cleaned.RData")   # dat_cc
+
+# Verify structure
+dim(dat_cc)
+table(dat_cc$hard_drugs_bl, useNA = "always")
+
+
+# =============================================================================
+# 1.  MODEL SPECIFICATION
+# =============================================================================
+# Define formulas centrally so they are easy to modify.
+
+# Outcome-specific baseline covariate
+outcomes <- list(
+  list(name  = "delta_log_VLOAD",
+       y     = "delta_log_VLOAD",
+       label = "Change in Log10 Viral Load"),
+  list(name  = "delta_LEU3N",
+       y     = "delta_LEU3N",
+       label = "Change in CD4+ T Cell Count"),
+  list(name  = "delta_AGG_PHYS",
+       y     = "delta_AGG_PHYS",
+       label = "Change in Physical QoL"),
+  list(name  = "delta_AGG_MENT",
+       y     = "delta_AGG_MENT",
+       label = "Change in Mental QoL")
+)
+
+# Confounders (same for all outcomes)
+confounders <- c("age_bl", "RACE_bin_bl", "EDUC_bin_bl", "BMI_bl", "SMOKE_bin_bl")
+
+# Build formula strings
+make_formula <- function(y, rhs_vars) {
+  as.formula(paste(y, "~", paste(rhs_vars, collapse = " + ")))
+}
+
+
+# =============================================================================
+# 2.  FIT MODELS
+# =============================================================================
+
+results_list <- list()
+
+for (o in outcomes) {
+
+  # Model 1: Unadjusted
+f1 <- make_formula(o$y, "hard_drugs_bl")
+
+# Model 2: Adjusted (no baseline outcome — it's in the change score)
+f2 <- make_formula(o$y, c("hard_drugs_bl", confounders))
+
+# Model 3: Adjusted + Adherence
+f3 <- make_formula(o$y, c("hard_drugs_bl", confounders, "ADH_cat"))
+
+  results_list[[o$name]] <- list(
+    unadj    = m1,
+    adj      = m2,
+    adj_adh  = m3,
+    label    = o$label,
+    y        = o$y,
+    y_bl     = o$y_bl
+  )
+}
+
+
+# =============================================================================
+# 3.  MODEL SUMMARIES
+# =============================================================================
+
+# --- 3.1 Full summaries for each model ---
+for (nm in names(results_list)) {
+  r <- results_list[[nm]]
+
+  message("============================================================")
+  message("OUTCOME: ", r$label)
+  message("============================================================")
+
+  message("\n--- Model 1: Unadjusted ---")
+  print(summary(r$unadj))
+
+  message("\n--- Model 2: Adjusted ---")
+  print(summary(r$adj))
+
+  message("\n--- Model 3: Adjusted + Adherence ---")
+  print(summary(r$adj_adh))
+}
+
+
+# --- 3.2 Tidy coefficient table for the hard_drugs_bl effect ---
+extract_drug_effect <- function(model, model_label, outcome_label) {
+  tidy(model, conf.int = TRUE) %>%
+    filter(term == "hard_drugs_blYes") %>%
+    mutate(
+      Outcome = outcome_label,
+      Model   = model_label
+    ) %>%
+    select(Outcome, Model, estimate, std.error, statistic,
+           p.value, conf.low, conf.high)
+}
+
+drug_effects <- map_dfr(names(results_list), function(nm) {
+  r <- results_list[[nm]]
+  bind_rows(
+    extract_drug_effect(r$unadj,   "Unadjusted",            r$label),
+    extract_drug_effect(r$adj,     "Adjusted",              r$label),
+    extract_drug_effect(r$adj_adh, "Adjusted + Adherence",  r$label)
+  )
+})
+
+# Round for readability
+drug_effects <- drug_effects %>%
+  mutate(across(c(estimate, std.error, statistic, conf.low, conf.high),
+                ~ round(., 4)),
+         p.value = round(p.value, 4))
+
+drug_effects
+
+
+# =============================================================================
+# 4.  MEDIATION ASSESSMENT — COMPARE MODELS 2 AND 3
+# =============================================================================
+# If the hard_drugs_bl coefficient attenuates when adherence is added,
+# this suggests adherence partially mediates the drug use effect.
+
+mediation_compare <- drug_effects %>%
+  filter(Model %in% c("Adjusted", "Adjusted + Adherence")) %>%
+  select(Outcome, Model, estimate) %>%
+  pivot_wider(names_from = Model, values_from = estimate,
+              names_prefix = "est_") %>%
+  rename(est_adj     = `est_Adjusted`,
+         est_adj_adh = `est_Adjusted + Adherence`) %>%
+  mutate(
+    change     = est_adj_adh - est_adj,
+    pct_change = round(100 * change / est_adj, 1)
+  )
+
+mediation_compare
+
+
+# =============================================================================
+# 5.  MODEL DIAGNOSTICS
+# =============================================================================
+
+# --- 5.1  Residual diagnostic plots ---
+# Generate 4-panel diagnostic plots for each adjusted model
+
+for (nm in names(results_list)) {
+  r <- results_list[[nm]]
+
+  par(mfrow = c(2, 2))
+  plot(r$adj, main = paste(r$label, "— Adjusted Model"))
+  par(mfrow = c(1, 1))
+}
+
+
+# --- 5.2  Variance Inflation Factors (multicollinearity check) ---
+vif_list <- map_dfr(names(results_list), function(nm) {
+  r <- results_list[[nm]]
+  vif_vals <- vif(r$adj)
+
+  # vif() returns a matrix for factors; extract GVIF^(1/(2*Df))
+  if (is.matrix(vif_vals)) {
+    tibble(
+      Outcome  = r$label,
+      Variable = rownames(vif_vals),
+      GVIF     = round(vif_vals[, "GVIF"], 3),
+      Df       = vif_vals[, "Df"],
+      GVIF_adj = round(vif_vals[, "GVIF^(1/(2*Df))"], 3)
+    )
+  } else {
+    tibble(
+      Outcome  = r$label,
+      Variable = names(vif_vals),
+      GVIF     = round(vif_vals, 3),
+      Df       = 1,
+      GVIF_adj = round(sqrt(vif_vals), 3)
+    )
+  }
+})
+
+vif_list
+
+
+# --- 5.3  Normality of residuals (Shapiro-Wilk on a subsample) ---
+# Full sample may be too large for shapiro.test; use random subsample of 500
+set.seed(42)
+
+normality_tests <- map_dfr(names(results_list), function(nm) {
+  r <- results_list[[nm]]
+  resids <- residuals(r$adj)
+  n_samp <- min(length(resids), 500)
+  samp   <- sample(resids, n_samp)
+  sw     <- shapiro.test(samp)
+
+  tibble(
+    Outcome   = r$label,
+    W         = round(sw$statistic, 4),
+    p.value   = round(sw$p.value, 4),
+    n_sampled = n_samp
+  )
+})
+
+normality_tests
+
+
+# --- 5.4  Residual plots by exposure group ---
+# Check whether residual variance differs by hard drug use (homoscedasticity)
+
+for (nm in names(results_list)) {
+  r <- results_list[[nm]]
+
+  diag_data <- dat_cc %>%
+    filter(complete.cases(dat_cc[, c(r$y, r$y_bl, confounders)])) %>%
+    mutate(
+      fitted_vals = fitted(r$adj),
+      residuals   = residuals(r$adj)
+    )
+
+  p <- ggplot(diag_data, aes(x = fitted_vals, y = residuals,
+                              colour = hard_drugs_bl)) +
+    geom_point(alpha = 0.4, size = 1.2) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_smooth(method = "loess", se = FALSE, linewidth = 0.7) +
+    scale_colour_manual(values = c("No" = "#2C7BB6", "Yes" = "#D7191C"),
+                        name = "BL Hard Drug Use") +
+    labs(title = paste(r$label, "— Residuals vs. Fitted by Drug Use"),
+         x = "Fitted Values", y = "Residuals") +
+    theme_minimal(base_size = 11) +
+    theme(legend.position = "bottom")
+
+  print(p)
+}
+
+
+# =============================================================================
+# 6.  R-SQUARED COMPARISON
+# =============================================================================
+
+r2_table <- map_dfr(names(results_list), function(nm) {
+  r <- results_list[[nm]]
+  tibble(
+    Outcome             = r$label,
+    R2_unadj            = round(summary(r$unadj)$r.squared, 4),
+    R2_adj_model        = round(summary(r$adj)$r.squared, 4),
+    Adj_R2_adj_model    = round(summary(r$adj)$adj.r.squared, 4),
+    R2_adj_adh          = round(summary(r$adj_adh)$r.squared, 4),
+    Adj_R2_adj_adh      = round(summary(r$adj_adh)$adj.r.squared, 4)
+  )
+})
+
+r2_table
+
+
+# =============================================================================
+# 7.  SUMMARY TABLE — HARD DRUG USE EFFECT ACROSS ALL MODELS
+# =============================================================================
+
+summary_table <- drug_effects %>%
+  mutate(
+    Effect = paste0(
+      formatC(estimate, format = "f", digits = 3),
+      " (",
+      formatC(conf.low, format = "f", digits = 3),
+      ", ",
+      formatC(conf.high, format = "f", digits = 3),
+      ")"
+    ),
+    p_display = ifelse(p.value < 0.001, "<0.001",
+                       formatC(p.value, format = "f", digits = 3))
+  ) %>%
+  select(Outcome, Model, Effect, p_display)
+
+summary_table
+
+
+# =============================================================================
+# 8.  SAVE RESULTS
+# =============================================================================
+
+save(results_list, drug_effects, mediation_compare, r2_table,
+     file = "freq_results.RData")
+
+
+```

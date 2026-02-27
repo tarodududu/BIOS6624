@@ -1,0 +1,499 @@
+---
+title: "Bayesian"
+author: "Qingyang Du"
+date: "2026-02-26"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+###############################################################################
+#                      BAYESIAN ANALYSIS SCRIPT
+#
+# Project:  Treatment Response to HAART and Hard Drug Use
+# Prereq:   Run 01_data_cleaning_v3.R (produces hiv_cleaned.RData with dat_cc)
+#
+# Approach: Follows the professor's cmdstanr workflow:
+#   1. Write a generic Stan linear regression model
+#   2. Compile once, reuse for all outcomes
+#   3. Prepare data (design matrix + priors) per outcome
+#   4. Fit via MCMC (4 chains)
+#   5. Summarize posteriors (mean, SD, MCSE, 95% HPDI, ESS)
+#   6. Model fit statistics (WAIC, LOO-IC, DIC)
+#   7. MCMC diagnostics (trace, density overlay, ACF, R-hat)
+#
+# Models (for each of 4 outcomes):
+#   Model 1: Adjusted — Y2 ~ hard_drugs_bl + Y_bl + confounders
+#   Model 2: Adjusted + Adherence — Model 1 + ADH_cat
+###############################################################################
+
+
+# =============================================================================
+# 0.  LOAD PACKAGES AND DATA
+# =============================================================================
+```{r}
+# install.packages("cmdstanr", repos = c('https://stan-dev.r-universe.dev',
+#                                         getOption("repos")))
+# library(cmdstanr)
+# install_cmdstan()   # Run once to install CmdStan backend
+
+library(cmdstanr)
+library(bayesplot)   # MCMC diagnostic plots
+library(posterior)   # summarizing posterior draws
+library(bayestestR)  # highest density posterior intervals (hdi)
+library(mcmcse)      # Monte Carlo standard errors
+library(loo)         # WAIC and LOO-IC
+library(dplyr)
+library(tibble)
+
+load("hiv_cleaned.RData")   # contains dat_cc
+
+
+
+
+# =============================================================================
+# 1.  WRITE THE STAN MODEL (reusable for all outcomes)
+# =============================================================================
+# Same structure as the professor's example: normal priors on beta,
+# half-normal prior on sigma, generated quantities for log-likelihood.
+
+stan_code <- "data {
+  int<lower=0> N;                  // number of observations
+  int<lower=0> P;                  // number of predictors including intercept
+  matrix[N, P] X;                  // design matrix (first column = intercept)
+  vector[N] y;                     // outcome
+
+  vector[P] prior_mean;            // prior means for each beta
+  vector<lower=0>[P] prior_sd;     // prior SDs for each beta
+
+  real<lower=0> sigma_prior_sd;    // SD for half-normal prior on sigma
+}
+
+parameters {
+  vector[P] beta;                  // regression coefficients
+  real<lower=0> sigma;             // residual SD
+}
+
+model {
+  // Priors for regression coefficients
+  beta ~ normal(prior_mean, prior_sd);
+
+  // Half-normal prior for sigma
+  sigma ~ normal(0, sigma_prior_sd);
+
+  // Likelihood
+  y ~ normal(X * beta, sigma);
+}
+
+generated quantities {
+  // Log likelihood for each observation (for WAIC / LOO-IC)
+  vector[N] log_lik;
+  for (n in 1:N) {
+    log_lik[n] = normal_lpdf(y[n] | X[n] * beta, sigma);
+  }
+}
+"
+
+stan_file <- write_stan_file(stan_code, dir = ".", basename = "linear_regression")
+
+
+# =============================================================================
+# 2.  COMPILE THE STAN MODEL
+# =============================================================================
+
+mod <- cmdstan_model(stan_file)
+
+
+# =============================================================================
+# 3.  DEFINE OUTCOMES AND PRIOR SPECIFICATIONS
+# =============================================================================
+
+# Outcome definitions — same structure as frequentist script
+outcomes <- list(
+  list(name  = "delta_log_VLOAD",
+       y     = "delta_log_VLOAD",
+       label = "Change in Log10 Viral Load"),
+  list(name  = "delta_LEU3N",
+       y     = "delta_LEU3N",
+       label = "Change in CD4+ T Cell Count"),
+  list(name  = "delta_AGG_PHYS",
+       y     = "delta_AGG_PHYS",
+       label = "Change in Physical QoL"),
+  list(name  = "delta_AGG_MENT",
+       y     = "delta_AGG_MENT",
+       label = "Change in Mental QoL")
+)
+
+# Confounders (same for all outcomes)
+confounders <- c("age_bl", "RACE_bin_bl", "EDUC_bin_bl", "BMI_bl", "SMOKE_bin_bl")
+
+
+# =============================================================================
+# 4.  HELPER FUNCTION: PREPARE DATA AND SET PRIORS
+# =============================================================================
+
+prepare_stan_data <- function(dat, outcome_info, include_adherence = FALSE) {
+
+  # Build the model formula
+  rhs <- c("hard_drugs_bl", confounders)
+  if (include_adherence) rhs <- c(rhs, "ADH_cat")
+  f <- as.formula(paste(outcome_info$y, "~", paste(rhs, collapse = " + ")))
+
+  # Design matrix
+  X <- model.matrix(f, data = dat)
+  y <- dat[[outcome_info$y]]
+
+  N <- nrow(X)
+  P <- ncol(X)
+
+  # --- Prior specification ---
+  # Weakly informative priors scaled to the outcome:
+  #   Intercept: Normal(mean(y), 2 * sd(y))  — centered on the data mean
+  #   All other coefficients: Normal(0, sd(y)) — centered at no effect,
+  #     scaled to the outcome's SD so they are weakly informative
+  #   Sigma: half-Normal(0, 2 * sd(y))
+
+  y_sd <- sd(y)
+  y_mean <- mean(y)
+
+  m <- c(y_mean, rep(0, P - 1))       # prior means
+  s <- c(2 * y_sd, rep(y_sd, P - 1))  # prior SDs
+  sigma_sd <- 2 * y_sd                 # sigma prior SD
+
+  data_list <- list(
+    N = N,
+    P = P,
+    X = X,
+    y = y,
+    prior_mean = m,
+    prior_sd = s,
+    sigma_prior_sd = sigma_sd
+  )
+
+  list(data_list = data_list, X = X, y = y, P = P, N = N,
+       col_names = colnames(X))
+}
+
+
+# =============================================================================
+# 5.  HELPER FUNCTION: SUMMARIZE POSTERIOR
+# =============================================================================
+
+summarize_posterior <- function(fit, col_names) {
+  draws_mat <- as_draws_matrix(fit$draws())
+  params <- colnames(draws_mat)
+  params <- params[!grepl("lp__|log_lik", params)]
+
+  summary_table <- lapply(params, function(p) {
+    vals <- as.numeric(draws_mat[, p])
+
+    # Monte Carlo standard error
+    mcse_val <- mcmcse::mcse(vals)$se
+
+    # Effective sample size
+    ess_val <- ess_bulk(vals)
+
+    # 95% Highest Posterior Density Interval
+    hpd <- hdi(vals, ci = 0.95)
+
+    tibble(
+      Parameter     = p,
+      Estimate      = mean(vals),
+      MCSE          = mcse_val,
+      Posterior_SD  = sd(vals),
+      HPDI_2.5      = hpd$CI_low,
+      HPDI_97.5     = hpd$CI_high,
+      ESS           = ess_val
+    )
+  }) %>% bind_rows()
+
+  # Map beta indices to variable names
+  beta_idx <- grep("^beta\\[", summary_table$Parameter)
+  if (length(beta_idx) == length(col_names)) {
+    summary_table$Variable <- NA_character_
+    summary_table$Variable[beta_idx] <- col_names
+    summary_table$Variable[summary_table$Parameter == "sigma"] <- "sigma"
+    summary_table <- summary_table %>%
+      select(Parameter, Variable, everything())
+  }
+
+  # Check MCSE < 6% of posterior SD
+  summary_table <- summary_table %>%
+    mutate(MCSE_pct_SD = round(100 * MCSE / Posterior_SD, 2),
+           MCSE_OK     = MCSE_pct_SD < 6)
+
+  summary_table
+}
+
+
+# =============================================================================
+# 6.  HELPER FUNCTION: MODEL FIT STATISTICS
+# =============================================================================
+
+compute_fit_stats <- function(fit, X, y) {
+  draws_mat <- as_draws_matrix(fit$draws())
+  loglik_mat <- as_draws_matrix(fit$draws("log_lik"))
+
+  # LOO-IC
+  loo_res <- loo(loglik_mat)
+
+  # WAIC
+  waic_res <- waic(loglik_mat)
+
+  # DIC (computed by hand, following professor's approach)
+  D_theta <- -2 * rowSums(loglik_mat)
+  mean_D <- mean(D_theta)
+
+  beta_mean <- colMeans(draws_mat[, grep("^beta\\[", colnames(draws_mat))])
+  sigma_mean <- mean(draws_mat[, "sigma"])
+  D_bar_theta <- -2 * sum(dnorm(y, mean = X %*% beta_mean,
+                                 sd = sigma_mean, log = TRUE))
+  DIC <- 2 * mean_D - D_bar_theta
+
+  list(loo = loo_res, waic = waic_res, DIC = DIC)
+}
+
+
+# =============================================================================
+# 7.  HELPER FUNCTION: MCMC DIAGNOSTICS
+# =============================================================================
+
+run_diagnostics <- function(fit, col_names, outcome_label, model_label) {
+
+  draws_array <- as_draws_array(fit$draws())
+
+  # Build parameter names for diagnostic plots
+  P <- length(col_names)
+  param_names <- c(paste0("beta[", 1:P, "]"), "sigma")
+
+  # Trace plots
+  p_trace <- mcmc_trace(draws_array, pars = param_names) +
+    ggtitle(paste(outcome_label, "-", model_label, ": Trace Plots"))
+  print(p_trace)
+
+  # Posterior density overlay across chains
+  p_dens <- mcmc_dens_overlay(draws_array, pars = param_names) +
+    ggtitle(paste(outcome_label, "-", model_label, ": Posterior Densities"))
+  print(p_dens)
+
+  # Autocorrelation
+  p_acf <- mcmc_acf(draws_array, pars = param_names) +
+    ggtitle(paste(outcome_label, "-", model_label, ": Autocorrelation"))
+  print(p_acf)
+
+  # R-hat and ESS from cmdstanr
+  rhat_summary <- fit$summary(variables = param_names)
+  print(rhat_summary)
+
+  # CmdStan diagnostics (divergences, treedepth, energy)
+  fit$cmdstan_diagnose()
+}
+
+```
+
+```{r}
+# =============================================================================
+# 8.  FIT ALL MODELS
+# =============================================================================
+
+bayes_results <- list()
+
+for (o in outcomes) {
+
+  message("\n============================================================")
+  message("FITTING: ", o$label)
+  message("============================================================\n")
+
+  # --- Model 1: Adjusted (no adherence) ---
+  prep1 <- prepare_stan_data(dat_cc, o, include_adherence = FALSE)
+
+  fit1 <- mod$sample(
+    data = prep1$data_list,
+    chains = 4,
+    iter_warmup = 2500,
+    iter_sampling = 10000,
+    seed = 42,
+    parallel_chains = 4
+  )
+
+  summ1 <- summarize_posterior(fit1, prep1$col_names)
+  fits1 <- compute_fit_stats(fit1, prep1$X, prep1$y)
+
+  message("\n--- Adjusted Model Summary ---")
+  print(summ1)
+  message("DIC: ", round(fits1$DIC, 2))
+
+  # --- Model 2: Adjusted + Adherence ---
+  prep2 <- prepare_stan_data(dat_cc, o, include_adherence = TRUE)
+
+  fit2 <- mod$sample(
+    data = prep2$data_list,
+    chains = 4,
+    iter_warmup = 2500,
+    iter_sampling = 10000,
+    seed = 42,
+    parallel_chains = 4
+  )
+
+  summ2 <- summarize_posterior(fit2, prep2$col_names)
+  fits2 <- compute_fit_stats(fit2, prep2$X, prep2$y)
+
+  message("\n--- Adjusted + Adherence Model Summary ---")
+  print(summ2)
+  message("DIC: ", round(fits2$DIC, 2))
+
+  # Store results
+  bayes_results[[o$name]] <- list(
+    label        = o$label,
+    # Adjusted model
+    fit_adj      = fit1,
+    summary_adj  = summ1,
+    fitstats_adj = fits1,
+    prep_adj     = prep1,
+    # Adjusted + adherence
+    fit_adj_adh      = fit2,
+    summary_adj_adh  = summ2,
+    fitstats_adj_adh = fits2,
+    prep_adj_adh     = prep2
+  )
+}
+
+
+# =============================================================================
+# 9.  EXTRACT HARD DRUG USE EFFECT ACROSS ALL MODELS
+# =============================================================================
+
+extract_drug_bayes <- function(summary_tbl, model_label, outcome_label) {
+  summary_tbl %>%
+    filter(Variable == "hard_drugs_blYes") %>%
+    mutate(Outcome = outcome_label, Model = model_label) %>%
+    select(Outcome, Model, Estimate, Posterior_SD, HPDI_2.5, HPDI_97.5,
+           ESS, MCSE, MCSE_pct_SD, MCSE_OK)
+}
+
+bayes_drug_effects <- map_dfr(names(bayes_results), function(nm) {
+  r <- bayes_results[[nm]]
+  bind_rows(
+    extract_drug_bayes(r$summary_adj,     "Adjusted",             r$label),
+    extract_drug_bayes(r$summary_adj_adh, "Adjusted + Adherence", r$label)
+  )
+})
+
+bayes_drug_effects <- bayes_drug_effects %>%
+  mutate(across(c(Estimate, Posterior_SD, HPDI_2.5, HPDI_97.5, MCSE),
+                ~ round(., 4)),
+         ESS = round(ESS, 0))
+
+bayes_drug_effects
+
+
+# =============================================================================
+# 10.  POSTERIOR PROBABILITY OF HYPOTHESIZED DIRECTION
+# =============================================================================
+# H1: hard drug users have WORSE outcomes at year 2:
+#   log_VLOAD: higher  → P(beta > 0)
+#   LEU3N:     lower   → P(beta < 0)
+#   AGG_PHYS:  lower   → P(beta < 0)
+#   AGG_MENT:  lower   → P(beta < 0)
+
+hypothesis_direction <- c(
+  "log_VLOAD" = "greater",    # beta > 0 means higher viral load
+  "LEU3N"     = "less",       # beta < 0 means lower CD4
+  "AGG_PHYS"  = "less",       # beta < 0 means lower physical QoL
+  "AGG_MENT"  = "less"        # beta < 0 means lower mental QoL
+)
+
+posterior_probs <- map_dfr(names(bayes_results), function(nm) {
+  r <- bayes_results[[nm]]
+  direction <- hypothesis_direction[[nm]]
+
+  # Extract hard_drugs_bl draws from adjusted model
+  draws_mat <- as_draws_matrix(r$fit_adj$draws())
+  drug_col <- which(r$prep_adj$col_names == "hard_drugs_blYes")
+  drug_draws <- as.numeric(draws_mat[, paste0("beta[", drug_col, "]")])
+
+  if (direction == "greater") {
+    prob <- mean(drug_draws > 0)
+  } else {
+    prob <- mean(drug_draws < 0)
+  }
+
+  tibble(
+    Outcome    = r$label,
+    Direction  = ifelse(direction == "greater",
+                        "P(beta > 0)", "P(beta < 0)"),
+    Probability = round(prob, 4)
+  )
+})
+
+posterior_probs
+
+
+# =============================================================================
+# 11.  MEDIATION COMPARISON (BAYESIAN)
+# =============================================================================
+
+bayes_mediation <- bayes_drug_effects %>%
+  select(Outcome, Model, Estimate) %>%
+  pivot_wider(names_from = Model, values_from = Estimate,
+              names_prefix = "est_") %>%
+  rename(est_adj     = `est_Adjusted`,
+         est_adj_adh = `est_Adjusted + Adherence`) %>%
+  mutate(
+    change     = est_adj_adh - est_adj,
+    pct_change = round(100 * change / est_adj, 1)
+  )
+
+bayes_mediation
+
+
+# =============================================================================
+# 12.  MCMC DIAGNOSTICS — ALL MODELS
+# =============================================================================
+
+for (nm in names(bayes_results)) {
+  r <- bayes_results[[nm]]
+
+  message("\n--- Diagnostics: ", r$label, " (Adjusted) ---")
+  run_diagnostics(r$fit_adj, r$prep_adj$col_names,
+                  r$label, "Adjusted")
+
+  message("\n--- Diagnostics: ", r$label, " (Adjusted + Adherence) ---")
+  run_diagnostics(r$fit_adj_adh, r$prep_adj_adh$col_names,
+                  r$label, "Adjusted + Adherence")
+}
+
+
+# =============================================================================
+# 13.  MODEL FIT COMPARISON TABLE
+# =============================================================================
+
+fit_comparison <- map_dfr(names(bayes_results), function(nm) {
+  r <- bayes_results[[nm]]
+  tibble(
+    Outcome         = r$label,
+    # Adjusted model
+    DIC_adj         = round(r$fitstats_adj$DIC, 2),
+    WAIC_adj        = round(r$fitstats_adj$waic$estimates["waic", "Estimate"], 2),
+    LOOIC_adj       = round(r$fitstats_adj$loo$estimates["looic", "Estimate"], 2),
+    # Adjusted + adherence
+    DIC_adj_adh     = round(r$fitstats_adj_adh$DIC, 2),
+    WAIC_adj_adh    = round(r$fitstats_adj_adh$waic$estimates["waic", "Estimate"], 2),
+    LOOIC_adj_adh   = round(r$fitstats_adj_adh$loo$estimates["looic", "Estimate"], 2)
+  )
+})
+
+fit_comparison
+
+
+# =============================================================================
+# 14.  SAVE ALL RESULTS
+# =============================================================================
+
+save(bayes_results, bayes_drug_effects, posterior_probs,
+     bayes_mediation, fit_comparison,
+     file = "bayes_results.RData")
+
+```
