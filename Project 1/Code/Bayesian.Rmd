@@ -475,17 +475,17 @@ bayes_mediation
 # 12.  MCMC DIAGNOSTICS — ALL MODELS
 # =============================================================================
 
-for (nm in names(bayes_results)) {
-  r <- bayes_results[[nm]]
+#for (nm in names(bayes_results)) {
+#  r <- bayes_results[[nm]]
 
-  message("\n--- Diagnostics: ", r$label, " (Adjusted) ---")
-  run_diagnostics(r$fit_adj, r$prep_adj$col_names,
-                  r$label, "Adjusted")
+#  message("\n--- Diagnostics: ", r$label, " (Adjusted) ---")
+#  run_diagnostics(r$fit_adj, r$prep_adj$col_names,
+#                  r$label, "Adjusted")
 
-  message("\n--- Diagnostics: ", r$label, " (Adjusted + Adherence) ---")
-  run_diagnostics(r$fit_adj_adh, r$prep_adj_adh$col_names,
-                  r$label, "Adjusted + Adherence")
-}
+  #message("\n--- Diagnostics: ", r$label, " (Adjusted + Adherence) ---")
+  #run_diagnostics(r$fit_adj_adh, r$prep_adj_adh$col_names,
+  #                r$label, "Adjusted + Adherence")
+#}
 
 
 # =============================================================================
@@ -513,9 +513,101 @@ fit_comparison
 # =============================================================================
 # 14.  SAVE ALL RESULTS
 # =============================================================================
+```
 
+```{r}
+###############################################################################
+#  DIAGNOSTIC FIGURES — Add to end of Bayesian.Rmd
+#
+#  Figure 1: Posterior density of hard drug use coefficient (4-panel)
+#  Figure 2: Frequentist Q-Q plots for residuals (4-panel)
+#
+#  Prereqs: bayes_results (from Bayesian.Rmd), freq_results.RData
+###############################################################################
+
+library(tidyverse)
+
+# =============================================================================
+# FIGURE 1: POSTERIOR DENSITY PLOTS
+# =============================================================================
+# Extract posterior draws for the hard drug use coefficient (beta[1])
+# from each outcome's adjusted model fit
+
+outcome_names <- names(bayes_results)
+
+# Clinical thresholds for each outcome (on the change-score scale)
+# Viral load: worse = beta > 0, threshold = 0.5
+# CD4+:       worse = beta < 0, threshold = -50
+# Phys QoL:   worse = beta < 0, threshold = -2
+# Ment QoL:   worse = beta < 0, threshold = -2
+thresholds <- c(0.5, -50, -2, -2)
+
+# Short labels for panels
+panel_labels <- c(
+  expression(Delta ~ Log[10] ~ "Viral Load"),
+  expression(Delta ~ "CD4+ T Cell Count"),
+  expression(Delta ~ "Physical QoL"),
+  expression(Delta ~ "Mental QoL")
+)
+
+# Extract draws into a single data frame
+draws_list <- map2_dfr(outcome_names, seq_along(outcome_names), function(nm, i) {
+  fit <- bayes_results[[nm]]$fit_adj
+  # beta[1] = hard drug use (first predictor after intercept alpha)
+  d <- as.numeric(fit$draws(variables = "beta[2]", format = "matrix"))
+  tibble(
+    Outcome  = nm,
+    panel_id = i,
+    draw     = d
+  )
+})
+
+# Assign panel labels as factor for faceting
+draws_list <- draws_list %>%
+  mutate(panel_label = factor(panel_id,
+                              levels = 1:4,
+                              labels = c("Delta Log10 Viral Load",
+                                         "Delta CD4+ T Cell Count",
+                                         "Delta Physical QoL",
+                                         "Delta Mental QoL")))
+
+# Threshold and zero reference lines per panel
+ref_lines <- tibble(
+  panel_label = factor(c("Delta Log10 Viral Load",
+                          "Delta CD4+ T Cell Count",
+                          "Delta Physical QoL",
+                          "Delta Mental QoL"),
+                        levels = levels(draws_list$panel_label)),
+  threshold   = thresholds
+)
+
+fig1 <- ggplot(draws_list, aes(x = draw)) +
+  geom_density(fill = "#3182bd", alpha = 0.4, colour = "#08519c") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  geom_vline(data = ref_lines, aes(xintercept = threshold),
+             linetype = "dotted", colour = "firebrick", linewidth = 0.8) +
+  facet_wrap(~ panel_label, scales = "free", ncol = 2) +
+  labs(
+    title    = "Posterior Density of Hard Drug Use Effect (Adjusted Model)",
+    subtitle = "Dashed grey = null (0); dotted red = clinical threshold",
+    x = "Posterior Estimate",
+    y = "Density"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    strip.text      = element_text(face = "bold"),
+    plot.title       = element_text(size = 12, face = "bold"),
+    plot.subtitle    = element_text(size = 9, colour = "grey40"),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("fig1_posterior_densities.png", fig1,
+       width = 8, height = 6, dpi = 300)
+
+```
+
+```{r}
 save(bayes_results, bayes_drug_effects, posterior_probs,
      bayes_mediation, fit_comparison,
      file = "bayes_results.RData")
-
 ```
