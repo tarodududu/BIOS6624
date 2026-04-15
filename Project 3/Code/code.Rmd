@@ -1,0 +1,294 @@
+---
+title: "Untitled"
+author: "Qingyang Du"
+date: "2026-04-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(survival)
+library(tableone)
+```
+
+
+```{r}
+################################################################################
+# Framingham Heart Study - Interim Analysis Plan (Updated)
+# Outcome: Incident Stroke | Separate models by Sex
+# Follow-up: 10 years
+# Forced: Age, Diabetes, SysBP
+# Candidates: BPMEDS, CURSMOKE, TOTCHOL, BMI, PREVCHD
+################################################################################
+
+# ---- 1. Load and Prepare Data ------------------------------------------------
+
+dat <- read.csv("frmgham2.csv")
+dat$SEX <- factor(dat$SEX, levels = c(1, 2), labels = c("Male", "Female"))
+
+baseline <- dat %>%
+  filter(PERIOD == 1, PREVSTRK == 0)
+
+data.frame(
+  Total_Period1 = nrow(dat %>% filter(PERIOD == 1)),
+  Excluded_PrevStroke = nrow(dat %>% filter(PERIOD == 1, PREVSTRK == 1)),
+  Analytic_Cohort = nrow(baseline)
+)
+
+# ---- 2. Define 10-Year Outcome -----------------------------------------------
+
+baseline <- baseline %>%
+  mutate(
+    time10 = pmin(TIMESTRK, 3652),
+    stroke10 = ifelse(STROKE == 1 & TIMESTRK <= 3652, 1, 0)
+  )
+
+table(baseline$stroke10, baseline$SEX, dnn = c("Stroke", "Sex"))
+
+# ---- 3. Missingness Summary --------------------------------------------------
+
+all_vars <- c("AGE", "DIABETES", "SYSBP", "BPMEDS", "CURSMOKE",
+              "TOTCHOL", "BMI", "PREVCHD", "TIMESTRK", "STROKE")
+
+baseline %>%
+  select(all_of(all_vars)) %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "N_Missing")
+
+# ---- 4. Exploratory: Distributions ------------------------------------------
+
+baseline %>%
+  select(AGE, SYSBP, TOTCHOL, BMI) %>%
+  summary()
+
+sapply(c("AGE", "SYSBP", "TOTCHOL", "BMI"), function(v) {
+  x <- na.omit(baseline[[v]])
+  round(mean(((x - mean(x)) / sd(x))^3), 3)
+})
+
+# ---- 5. Correlation Among Covariates -----------------------------------------
+
+baseline %>%
+  select(AGE, SYSBP, BMI, TOTCHOL, DIABETES, BPMEDS, CURSMOKE, PREVCHD) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  cor(use = "pairwise.complete.obs") %>%
+  round(3)
+
+# ---- 6. Table 1 -------------------------------------------------------------
+
+table1_vars <- c("AGE", "SYSBP", "TOTCHOL", "BMI",
+                 "DIABETES", "BPMEDS", "CURSMOKE", "PREVCHD")
+cat_vars <- c("DIABETES", "BPMEDS", "CURSMOKE", "PREVCHD")
+
+# Table 1a: By Sex
+CreateTableOne(
+  vars = table1_vars, strata = "SEX", data = baseline,
+  factorVars = cat_vars, test = TRUE
+) %>% print(showAllLevels = TRUE, formatOptions = list(big.mark = ","))
+
+# Table 1b: By 10-Year Stroke Status
+CreateTableOne(
+  vars = table1_vars, strata = "stroke10", data = baseline,
+  factorVars = cat_vars, test = TRUE
+) %>% print(showAllLevels = TRUE, formatOptions = list(big.mark = ","))
+
+# ---- 7. Events per sex (for modeling feasibility) ----------------------------
+
+baseline %>%
+  group_by(SEX) %>%
+  summarise(
+    n = n(),
+    events = sum(stroke10),
+    rate_pct = round(mean(stroke10) * 100, 2)
+  )
+
+# ---- 8. Risk Factor Change Across Exam Periods -------------------------------
+
+dat_all3 <- dat %>%
+  group_by(RANDID) %>%
+  filter(n() == 3) %>%
+  ungroup()
+
+n_distinct(dat_all3$RANDID)
+
+# SYSBP by Period
+dat_all3 %>%
+  group_by(PERIOD) %>%
+  summarise(
+    n = n(),
+    mean = mean(SYSBP, na.rm = TRUE),
+    sd = sd(SYSBP, na.rm = TRUE),
+    median = median(SYSBP, na.rm = TRUE)
+  )
+
+# DIABETES Prevalence by Period
+dat_all3 %>%
+  group_by(PERIOD) %>%
+  summarise(
+    n = n(),
+    n_diabetes = sum(DIABETES, na.rm = TRUE),
+    pct = mean(DIABETES, na.rm = TRUE) * 100
+  )
+
+# SYSBP Change: Period 1 -> Period 3
+wide_sysbp <- dat_all3 %>%
+  select(RANDID, PERIOD, SYSBP) %>%
+  pivot_wider(names_from = PERIOD, values_from = SYSBP, names_prefix = "P") %>%
+  mutate(delta = P3 - P1)
+
+summary(wide_sysbp$delta)
+
+# Diabetes Transition: Period 1 -> Period 3
+wide_diab <- dat_all3 %>%
+  select(RANDID, PERIOD, DIABETES) %>%
+  pivot_wider(names_from = PERIOD, values_from = DIABETES, names_prefix = "P")
+
+table(wide_diab$P1, wide_diab$P3, dnn = c("Period1", "Period3"))
+
+
+```
+
+
+
+
+```{r}
+################################################################################
+# Framingham Heart Study - Interim Analysis Plan
+# Outcome: Incident Stroke | Stratified by Sex
+# Follow-up: 10 years | Covariates: Age, Diabetes, BMI, SysBP (baseline)
+################################################################################
+
+# ---- 1. Load and Prepare Data ------------------------------------------------
+
+dat <- read.csv("frmgham2.csv")
+dat$SEX <- factor(dat$SEX, levels = c(1, 2), labels = c("Male", "Female"))
+
+baseline <- dat %>%
+  filter(PERIOD == 1, PREVSTRK == 0)
+
+data.frame(
+  Total_Period1 = nrow(dat %>% filter(PERIOD == 1)),
+  Excluded_PrevStroke = nrow(dat %>% filter(PERIOD == 1, PREVSTRK == 1)),
+  Analytic_Cohort = nrow(baseline)
+)
+
+# ---- 2. Define 10-Year Outcome -----------------------------------------------
+
+baseline <- baseline %>%
+  mutate(
+    time10 = pmin(TIMESTRK, 3652),
+    stroke10 = ifelse(STROKE == 1 & TIMESTRK <= 3652, 1, 0)
+  )
+
+table(baseline$stroke10, baseline$SEX, dnn = c("Stroke", "Sex"))
+
+# ---- 3. Missingness Summary --------------------------------------------------
+
+baseline %>%
+  select(AGE, DIABETES, BMI, SYSBP, TIMESTRK, STROKE) %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "N_Missing")
+
+# ---- 4. Exploratory: Distributions & Outliers --------------------------------
+
+baseline %>% select(AGE, SYSBP, BMI) %>% summary()
+
+sapply(c("AGE", "SYSBP", "BMI"), function(v) {
+  x <- na.omit(baseline[[v]])
+  round(mean(((x - mean(x)) / sd(x))^3), 3)
+})
+
+# ---- 5. Correlation Among Covariates -----------------------------------------
+
+baseline %>%
+  select(AGE, SYSBP, BMI, DIABETES) %>%
+  cor(use = "pairwise.complete.obs") %>%
+  round(3)
+
+# ---- 6. Table 1 (tableone) --------------------------------------------------
+# NOTE: DIABETES, CURSMOKE, stroke10 are still numeric here — tableone needs that
+
+table1_vars <- c("AGE", "SYSBP", "BMI", "DIABETES", "CURSMOKE")
+cat_vars <- c("DIABETES", "CURSMOKE")
+
+# Table 1a: By Sex
+CreateTableOne(
+  vars = table1_vars, strata = "SEX", data = baseline,
+  factorVars = cat_vars, test = TRUE
+) %>% print(showAllLevels = TRUE, formatOptions = list(big.mark = ","))
+
+# Table 1b: By 10-Year Stroke Status
+CreateTableOne(
+  vars = table1_vars, strata = "stroke10", data = baseline,
+  factorVars = cat_vars, test = TRUE
+) %>% print(showAllLevels = TRUE, formatOptions = list(big.mark = ","))
+
+# ---- 7. Risk Factor Change Across Exam Periods (Descriptive) -----------------
+
+dat_all3 <- dat %>%
+  group_by(RANDID) %>%
+  filter(n() == 3) %>%
+  ungroup()
+
+n_distinct(dat_all3$RANDID)
+
+# SYSBP by Period
+dat_all3 %>%
+  group_by(PERIOD) %>%
+  summarise(
+    n = n(),
+    mean = mean(SYSBP, na.rm = TRUE),
+    sd = sd(SYSBP, na.rm = TRUE),
+    median = median(SYSBP, na.rm = TRUE)
+  )
+
+# DIABETES Prevalence by Period
+dat_all3 %>%
+  group_by(PERIOD) %>%
+  summarise(
+    n = n(),
+    n_diabetes = sum(DIABETES, na.rm = TRUE),
+    pct = mean(DIABETES, na.rm = TRUE) * 100
+  )
+
+# SYSBP Change: Period 1 -> Period 3
+wide_sysbp <- dat_all3 %>%
+  select(RANDID, PERIOD, SYSBP) %>%
+  pivot_wider(names_from = PERIOD, values_from = SYSBP, names_prefix = "P") %>%
+  mutate(delta = P3 - P1)
+
+summary(wide_sysbp$delta)
+
+# Diabetes Transition: Period 1 -> Period 3
+wide_diab <- dat_all3 %>%
+  select(RANDID, PERIOD, DIABETES) %>%
+  pivot_wider(names_from = PERIOD, values_from = DIABETES, names_prefix = "P")
+
+table(wide_diab$P1, wide_diab$P3, dnn = c("Period1", "Period3"))
+
+# SYSBP Change: Period 1 -> Period 2
+wide_sysbp <- dat_all3 %>%
+  select(RANDID, PERIOD, SYSBP) %>%
+  pivot_wider(names_from = PERIOD, values_from = SYSBP, names_prefix = "P") %>%
+  mutate(delta = P2 - P1)
+
+summary(wide_sysbp$delta)
+
+# Diabetes Transition: Period 1 -> Period 2
+wide_diab <- dat_all3 %>%
+  select(RANDID, PERIOD, DIABETES) %>%
+  pivot_wider(names_from = PERIOD, values_from = DIABETES, names_prefix = "P")
+
+table(wide_diab$P1, wide_diab$P2, dnn = c("Period1", "Period2"))
+
+
+
+```
+
+
+```{r}
+
+
+
+```
