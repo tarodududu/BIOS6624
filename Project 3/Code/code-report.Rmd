@@ -8,3 +8,394 @@ date: "2026-04-15"
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
+```{r}
+
+################################################################################
+# Framingham Heart Study - Full Project Analysis
+# Outcome: Incident Stroke (10-year follow-up)
+# Models: Separate Cox PH by sex
+# Forced: AGE, SYSBP, DIABETES
+# Candidates: BPMEDS, CURSMOKE, TOTCHOL, BMI, PREVCHD
+#
+# Data location: frmgham2.csv (same directory)
+################################################################################
+
+library(tidyverse)
+library(survival)
+library(tableone)
+
+# ==============================================================================
+# SECTION 1: DATA PREPARATION
+# ==============================================================================
+
+dat <- read.csv("frmgham2.csv")
+dat$SEX <- factor(dat$SEX, levels = c(1, 2), labels = c("Male", "Female"))
+
+# Baseline cohort: Period 1, exclude prevalent stroke
+baseline <- dat %>%
+  filter(PERIOD == 1, PREVSTRK == 0)
+
+# 10-year outcome (3652 days)
+baseline <- baseline %>%
+  mutate(
+    time10   = pmin(TIMESTRK, 3652),
+    stroke10 = ifelse(STROKE == 1 & TIMESTRK <= 3652, 1, 0)
+  )
+
+# Cohort flow
+data.frame(
+  Total_Period1     = nrow(dat %>% filter(PERIOD == 1)),
+  Excluded_PrevStrk = nrow(dat %>% filter(PERIOD == 1, PREVSTRK == 1)),
+  Analytic_Cohort   = nrow(baseline)
+)
+
+# Sex-specific sample sizes and event counts
+baseline %>%
+  group_by(SEX) %>%
+  summarise(n = n(), events = sum(stroke10), rate_pct = round(mean(stroke10)*100, 2))
+```
+
+```{r}
+# ==============================================================================
+# SECTION 2: MISSINGNESS
+# ==============================================================================
+
+all_vars <- c("AGE", "DIABETES", "SYSBP", "BPMEDS", "CURSMOKE",
+              "TOTCHOL", "BMI", "PREVCHD")
+
+baseline %>%
+  select(all_of(all_vars)) %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "N_Missing")
+```
+
+```{r}
+# ==============================================================================
+# SECTION 3: TABLE 1
+# ==============================================================================
+
+table1_vars <- c("AGE", "SYSBP", "TOTCHOL", "BMI",
+                 "DIABETES", "BPMEDS", "CURSMOKE", "PREVCHD")
+cat_vars    <- c("DIABETES", "BPMEDS", "CURSMOKE", "PREVCHD")
+
+# Table 1a: By Sex
+CreateTableOne(
+  vars = table1_vars, strata = "SEX", data = baseline,
+  factorVars = cat_vars, test = TRUE
+) %>% print(showAllLevels = TRUE, formatOptions = list(big.mark = ","),
+            missing = TRUE)
+
+# Table 1b: By 10-Year Stroke Status
+CreateTableOne(
+  vars = table1_vars, strata = "stroke10", data = baseline,
+  factorVars = cat_vars, test = TRUE
+) %>% print(showAllLevels = TRUE, formatOptions = list(big.mark = ","),
+            missing = TRUE)
+```
+
+```{r}
+# ==============================================================================
+# SECTION 4: EXPLORATORY ANALYSIS
+# ==============================================================================
+
+# 4a. Continuous variable summaries
+baseline %>% select(AGE, SYSBP, TOTCHOL, BMI) %>% summary()
+
+# 4b. Skewness
+sapply(c("AGE", "SYSBP", "TOTCHOL", "BMI"), function(v) {
+  x <- na.omit(baseline[[v]])
+  round(mean(((x - mean(x)) / sd(x))^3), 3)
+})
+
+# 4c. Correlation matrix
+baseline %>%
+  select(AGE, SYSBP, BMI, TOTCHOL, DIABETES, BPMEDS, CURSMOKE, PREVCHD) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  cor(use = "pairwise.complete.obs") %>%
+  round(3)
+```
+
+```{r}
+# ==============================================================================
+# SECTION 5: KAPLAN-MEIER ANALYSIS
+# ==============================================================================
+
+surv_obj <- Surv(baseline$time10, baseline$stroke10)
+
+# 5a. KM by Sex
+km_sex <- survfit(surv_obj ~ SEX, data = baseline)
+km_sex
+summary(km_sex, times = c(365, 1826, 3652))
+
+# Plot KM by sex
+pdf("km_by_sex.pdf", width = 7, height = 5)
+plot(km_sex, col = c("blue", "red"), lwd = 2,
+     xlab = "Time (days)", ylab = "Stroke-Free Probability",
+     main = "Kaplan-Meier Survival Estimates by Sex",
+     mark.time = TRUE)
+legend("bottomleft", legend = c("Male", "Female"),
+       col = c("blue", "red"), lwd = 2, bty = "n")
+dev.off()
+
+# Log-rank test by sex
+survdiff(surv_obj ~ SEX, data = baseline)
+
+# 5b. KM by Diabetes (overall and within sex)
+km_diab <- survfit(surv_obj ~ DIABETES, data = baseline)
+summary(km_diab, times = c(365, 1826, 3652))
+
+pdf("km_by_diabetes.pdf", width = 7, height = 5)
+plot(km_diab, col = c("forestgreen", "darkorange"), lwd = 2,
+     xlab = "Time (days)", ylab = "Stroke-Free Probability",
+     main = "Kaplan-Meier Survival Estimates by Diabetes Status")
+legend("bottomleft", legend = c("No Diabetes", "Diabetes"),
+       col = c("forestgreen", "darkorange"), lwd = 2, bty = "n")
+dev.off()
+
+survdiff(surv_obj ~ DIABETES, data = baseline)
+
+# 5c. KM by PREVCHD
+km_chd <- survfit(surv_obj ~ PREVCHD, data = baseline)
+summary(km_chd, times = c(365, 1826, 3652))
+survdiff(surv_obj ~ PREVCHD, data = baseline)
+
+# 5d. KM by BPMEDS
+km_bp <- survfit(surv_obj ~ BPMEDS, data = baseline)
+summary(km_bp, times = c(365, 1826, 3652))
+survdiff(surv_obj ~ BPMEDS, data = baseline)
+```
+
+```{r}
+# ==============================================================================
+# SECTION 6: COX PROPORTIONAL HAZARDS - SEPARATE BY SEX
+# ==============================================================================
+
+males   <- baseline %>% filter(SEX == "Male")
+females <- baseline %>% filter(SEX == "Female")
+
+# ------------------------------------------------------------------------------
+# 6a. Forced-only model (AGE + SYSBP + DIABETES)
+# ------------------------------------------------------------------------------
+
+cox_m_forced <- coxph(Surv(time10, stroke10) ~ AGE + SYSBP + DIABETES,
+                      data = males)
+summary(cox_m_forced)
+
+cox_f_forced <- coxph(Surv(time10, stroke10) ~ AGE + SYSBP + DIABETES,
+                      data = females)
+summary(cox_f_forced)
+
+# ------------------------------------------------------------------------------
+# 6b. Purposeful selection: add candidates one at a time
+#     Retain if p < 0.15 OR removal changes forced-variable HR by >15%
+# ------------------------------------------------------------------------------
+
+candidates <- c("BPMEDS", "CURSMOKE", "TOTCHOL", "BMI", "PREVCHD")
+
+## --- MALES ---
+
+# Step 1: Test each candidate individually (added to forced model)
+for (v in candidates) {
+  f <- as.formula(paste("Surv(time10, stroke10) ~ AGE + SYSBP + DIABETES +", v))
+  fit <- coxph(f, data = males)
+  pval <- summary(fit)$coefficients[v, "Pr(>|z|)"]
+  writeLines(sprintf("Male | + %s : p = %.4f", v, pval))
+}
+
+# Step 2: Fit full candidate model
+cox_m_full <- coxph(Surv(time10, stroke10) ~ AGE + SYSBP + DIABETES +
+                      BPMEDS + CURSMOKE + TOTCHOL + BMI + PREVCHD,
+                    data = males)
+summary(cox_m_full)
+
+# Step 3: Backward elimination from full model
+# Remove candidate with highest p > 0.15, refit, check confounding
+# Repeat until all candidates have p < 0.15 or are confounders
+
+# Helper: percent change in forced coefficients
+check_confounding <- function(fit_full, fit_reduced) {
+  forced <- c("AGE", "SYSBP", "DIABETES")
+  coef_full <- coef(fit_full)[forced]
+  coef_red  <- coef(fit_reduced)[forced]
+  pct_change <- abs((coef_red - coef_full) / coef_full) * 100
+  data.frame(Variable = forced, Full = round(coef_full, 5),
+             Reduced = round(coef_red, 5),
+             Pct_Change = round(pct_change, 1))
+}
+
+# Example: remove CURSMOKE (likely highest p), check confounding
+cox_m_drop1 <- coxph(Surv(time10, stroke10) ~ AGE + SYSBP + DIABETES +
+                       BPMEDS + TOTCHOL + BMI + PREVCHD,
+                     data = males)
+writeLines("Male | Drop CURSMOKE - confounding check:")
+check_confounding(cox_m_full, cox_m_drop1)
+
+# Continue removing iteratively — adjust the formulas below based on
+# the p-values from the full model output above
+
+# [After running, fill in the final male model here]
+# cox_m_final <- coxph(Surv(time10, stroke10) ~ AGE + SYSBP + DIABETES + ...,
+#                      data = males)
+# summary(cox_m_final)
+
+## --- FEMALES ---
+
+# Step 1: Test each candidate individually
+for (v in candidates) {
+  f <- as.formula(paste("Surv(time10, stroke10) ~ AGE + SYSBP + DIABETES +", v))
+  fit <- coxph(f, data = females)
+  pval <- summary(fit)$coefficients[v, "Pr(>|z|)"]
+  writeLines(sprintf("Female | + %s : p = %.4f", v, pval))
+}
+
+# Step 2: Full candidate model
+cox_f_full <- coxph(Surv(time10, stroke10) ~ AGE + SYSBP + DIABETES +
+                      BPMEDS + CURSMOKE + TOTCHOL + BMI + PREVCHD,
+                    data = females)
+summary(cox_f_full)
+
+# Step 3: Backward elimination (same process as males)
+cox_f_drop1 <- coxph(Surv(time10, stroke10) ~ AGE + SYSBP + DIABETES +
+                       BPMEDS + TOTCHOL + BMI + PREVCHD,
+                     data = females)
+writeLines("Female | Drop CURSMOKE - confounding check:")
+check_confounding(cox_f_full, cox_f_drop1)
+
+# [After running, fill in the final female model here]
+# cox_f_final <- coxph(Surv(time10, stroke10) ~ AGE + SYSBP + DIABETES + ...,
+#                      data = females)
+# summary(cox_f_final)
+```
+
+```{r}
+# ==============================================================================
+# SECTION 7: PROPORTIONAL HAZARDS DIAGNOSTICS
+# ==============================================================================
+
+# Schoenfeld residual test (run on final models; using forced model as placeholder)
+cox.zph(cox_m_forced)
+cox.zph(cox_f_forced)
+
+# Schoenfeld residual plots
+pdf("schoenfeld_males.pdf", width = 8, height = 6)
+par(mfrow = c(2, 2))
+plot(cox.zph(cox_m_forced))
+dev.off()
+
+pdf("schoenfeld_females.pdf", width = 8, height = 6)
+par(mfrow = c(2, 2))
+plot(cox.zph(cox_f_forced))
+dev.off()
+
+# Log-log survival plots by sex (visual PH check)
+pdf("loglog_sex.pdf", width = 7, height = 5)
+plot(km_sex, fun = "cloglog", col = c("blue", "red"), lwd = 2,
+     xlab = "log(Time)", ylab = "log(-log(S(t)))",
+     main = "Log-Log Survival Plot by Sex")
+legend("topleft", legend = c("Male", "Female"),
+       col = c("blue", "red"), lwd = 2, bty = "n")
+dev.off()
+```
+
+
+```{r}
+# ==============================================================================
+# SECTION 8: 10-YEAR STROKE PROBABILITY ESTIMATES
+# ==============================================================================
+
+# Define risk profiles (adjust model formula to match final model)
+# Using forced model as placeholder — update to final model after selection
+
+# Low risk: age 40, SBP 120, no diabetes
+# Moderate risk: age 55, SBP 140, no diabetes
+# High risk: age 65, SBP 160, diabetes
+
+risk_profiles <- data.frame(
+  AGE      = c(40, 55, 65),
+  SYSBP    = c(120, 140, 160),
+  DIABETES = c(0, 1, 1),
+  Profile  = c("Low Risk", "Moderate Risk", "High Risk")
+)
+
+# Male predictions
+surv_pred_m <- survfit(cox_m_forced,
+                       newdata = risk_profiles %>% select(-Profile))
+# Extract 10-year (3652-day) survival probabilities
+surv_summ_m <- summary(surv_pred_m, times = 3652)
+data.frame(
+  Profile     = risk_profiles$Profile,
+  Sex         = "Male",
+  Surv_10yr   = round(surv_summ_m$surv, 4),
+  Stroke_Prob = round(1 - surv_summ_m$surv, 4)
+)
+
+# Female predictions
+surv_pred_f <- survfit(cox_f_forced,
+                       newdata = risk_profiles %>% select(-Profile))
+surv_summ_f <- summary(surv_pred_f, times = 3652)
+data.frame(
+  Profile     = risk_profiles$Profile,
+  Sex         = "Female",
+  Surv_10yr   = round(surv_summ_f$surv, 4),
+  Stroke_Prob = round(1 - surv_summ_f$surv, 4)
+)
+```
+
+```{r}
+# ==============================================================================
+# SECTION 9: TIME-VARYING COVARIATE DESCRIPTIVE ANALYSIS
+# ==============================================================================
+
+dat_all3 <- dat %>%
+  group_by(RANDID) %>%
+  filter(n() == 3) %>%
+  ungroup()
+
+n_distinct(dat_all3$RANDID)
+
+# 9a. SYSBP by period
+dat_all3 %>%
+  group_by(PERIOD) %>%
+  summarise(n = n(), mean = mean(SYSBP, na.rm = TRUE),
+            sd = sd(SYSBP, na.rm = TRUE), median = median(SYSBP, na.rm = TRUE))
+
+# 9b. SYSBP change: P1->P2, P2->P3, and P1->P3
+wide_sysbp <- dat_all3 %>%
+  select(RANDID, PERIOD, SYSBP) %>%
+  pivot_wider(names_from = PERIOD, values_from = SYSBP, names_prefix = "P")
+
+wide_sysbp <- wide_sysbp %>%
+  mutate(delta_12 = P2 - P1,
+         delta_23 = P3 - P2,
+         delta_13 = P3 - P1)
+
+writeLines("SYSBP Change: Period 1 -> Period 2")
+summary(wide_sysbp$delta_12)
+
+writeLines("SYSBP Change: Period 2 -> Period 3")
+summary(wide_sysbp$delta_23)
+
+writeLines("SYSBP Change: Period 1 -> Period 3")
+summary(wide_sysbp$delta_13)
+
+# 9c. Diabetes prevalence by period
+dat_all3 %>%
+  group_by(PERIOD) %>%
+  summarise(n = n(), n_diabetes = sum(DIABETES, na.rm = TRUE),
+            pct = mean(DIABETES, na.rm = TRUE) * 100)
+
+# 9d. Diabetes transitions: P1->P2, P2->P3, P1->P3
+wide_diab <- dat_all3 %>%
+  select(RANDID, PERIOD, DIABETES) %>%
+  pivot_wider(names_from = PERIOD, values_from = DIABETES, names_prefix = "P")
+
+writeLines("Diabetes Transition: Period 1 -> Period 2")
+table(wide_diab$P1, wide_diab$P2, dnn = c("Period1", "Period2"))
+
+writeLines("Diabetes Transition: Period 2 -> Period 3")
+table(wide_diab$P2, wide_diab$P3, dnn = c("Period2", "Period3"))
+
+writeLines("Diabetes Transition: Period 1 -> Period 3")
+table(wide_diab$P1, wide_diab$P3, dnn = c("Period1", "Period3"))
+
+```
