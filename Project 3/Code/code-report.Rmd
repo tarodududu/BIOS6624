@@ -546,4 +546,36 @@ table(wide_diab$P2, wide_diab$P3, dnn = c("Period2", "Period3"))
 writeLines("Diabetes Transition: Period 1 -> Period 3")
 table(wide_diab$P1, wide_diab$P3, dnn = c("Period1", "Period3"))
 
+
+# 9e. BMI, TOTCHOL, CURSMOKE change across periods
+dat_all3 %>%
+  group_by(PERIOD) %>%
+  summarise(
+    mean_BMI     = mean(BMI, na.rm = TRUE),
+    sd_BMI       = sd(BMI, na.rm = TRUE),
+    mean_TOTCHOL = mean(TOTCHOL, na.rm = TRUE),
+    sd_TOTCHOL   = sd(TOTCHOL, na.rm = TRUE),
+    pct_CURSMOKE = mean(CURSMOKE, na.rm = TRUE) * 100
+  )
+
+# Within-person BMI change P1 -> P3
+wide_bmi <- dat_all3 %>%
+  select(RANDID, PERIOD, BMI) %>%
+  pivot_wider(names_from = PERIOD, values_from = BMI, names_prefix = "P") %>%
+  mutate(delta_13 = P3 - P1)
+summary(wide_bmi$delta_13)
+
+# Within-person TOTCHOL change P1 -> P3
+wide_chol <- dat_all3 %>%
+  select(RANDID, PERIOD, TOTCHOL) %>%
+  pivot_wider(names_from = PERIOD, values_from = TOTCHOL, names_prefix = "P") %>%
+  mutate(delta_13 = P3 - P1)
+summary(wide_chol$delta_13)
+
+# Smoking transition P1 -> P3
+wide_smoke <- dat_all3 %>%
+  select(RANDID, PERIOD, CURSMOKE) %>%
+  pivot_wider(names_from = PERIOD, values_from = CURSMOKE, names_prefix = "P")
+table(wide_smoke$P1, wide_smoke$P3, dnn = c("Period1", "Period3"))
+
 ```
