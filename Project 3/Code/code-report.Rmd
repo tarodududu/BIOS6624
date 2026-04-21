@@ -137,6 +137,40 @@ legend("bottomleft", legend = c("Male", "Female"),
        col = c("blue", "red"), lwd = 2, bty = "n")
 dev.off()
 
+
+pdf("km_panel.pdf", width = 10, height = 8)
+par(mfrow = c(2, 2))
+
+plot(survfit(surv_obj ~ DIABETES, data = baseline),
+     col = c("forestgreen", "darkorange"), lwd = 2,
+     xlab = "Time (days)", ylab = "Stroke-Free Probability",
+     main = "By Diabetes Status", ylim = c(0.80, 1.0))
+legend("bottomleft", legend = c("No", "Yes"),
+       col = c("forestgreen", "darkorange"), lwd = 2, bty = "n", cex = 0.9)
+
+plot(survfit(surv_obj ~ BPMEDS, data = baseline),
+     col = c("steelblue", "firebrick"), lwd = 2,
+     xlab = "Time (days)", ylab = "Stroke-Free Probability",
+     main = "By BP Medication Use", ylim = c(0.80, 1.0))
+legend("bottomleft", legend = c("No", "Yes"),
+       col = c("steelblue", "firebrick"), lwd = 2, bty = "n", cex = 0.9)
+
+plot(survfit(surv_obj ~ PREVCHD, data = baseline),
+     col = c("purple", "goldenrod"), lwd = 2,
+     xlab = "Time (days)", ylab = "Stroke-Free Probability",
+     main = "By Prevalent CHD", ylim = c(0.80, 1.0))
+legend("bottomleft", legend = c("No", "Yes"),
+       col = c("purple", "goldenrod"), lwd = 2, bty = "n", cex = 0.9)
+
+plot(survfit(surv_obj ~ CURSMOKE, data = baseline),
+     col = c("gray40", "coral"), lwd = 2,
+     xlab = "Time (days)", ylab = "Stroke-Free Probability",
+     main = "By Current Smoking", ylim = c(0.80, 1.0))
+legend("bottomleft", legend = c("No", "Yes"),
+       col = c("gray40", "coral"), lwd = 2, bty = "n", cex = 0.9)
+
+dev.off()
+
 # Log-rank test by sex
 survdiff(surv_obj ~ SEX, data = baseline)
 
