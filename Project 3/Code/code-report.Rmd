@@ -184,7 +184,9 @@ summary(cox_m_forced)
 cox_f_forced <- coxph(Surv(time10, stroke10) ~ AGE + SYSBP + DIABETES,
                       data = females)
 summary(cox_f_forced)
+```
 
+```{r}
 # ------------------------------------------------------------------------------
 # 6b. Purposeful selection: add candidates one at a time
 #     Retain if p < 0.15 OR removal changes forced-variable HR by >15%
@@ -238,6 +240,43 @@ check_confounding(cox_m_full, cox_m_drop1)
 #                      data = males)
 # summary(cox_m_final)
 
+
+```
+```{r}
+# --- MALE: Backward elimination with confounding checks ---
+
+# Step 1: Drop PREVCHD (p = 0.925)
+cox_m_s1 <- coxph(Surv(time10, stroke10) ~ AGE + SYSBP + DIABETES +
+                    BPMEDS + CURSMOKE + TOTCHOL + BMI, data = males)
+summary(cox_m_s1)
+check_confounding(cox_m_full, cox_m_s1)
+
+# Step 2: Drop BMI
+cox_m_s2 <- coxph(Surv(time10, stroke10) ~ AGE + SYSBP + DIABETES +
+                    BPMEDS + CURSMOKE + TOTCHOL, data = males)
+summary(cox_m_s2)
+check_confounding(cox_m_full, cox_m_s2)
+
+# Step 3: Drop TOTCHOL
+cox_m_s3 <- coxph(Surv(time10, stroke10) ~ AGE + SYSBP + DIABETES +
+                    BPMEDS + CURSMOKE, data = males)
+summary(cox_m_s3)
+check_confounding(cox_m_full, cox_m_s3)
+
+# Step 4: Drop BPMEDS
+cox_m_s4 <- coxph(Surv(time10, stroke10) ~ AGE + SYSBP + DIABETES +
+                    CURSMOKE, data = males)
+summary(cox_m_s4)
+check_confounding(cox_m_full, cox_m_s4)
+
+# --- Final male model (pending confounding results) ---
+cox_m_final <- cox_m_s4
+summary(cox_m_final)
+
+
+```
+
+```{r}
 ## --- FEMALES ---
 
 # Step 1: Test each candidate individually
@@ -265,6 +304,47 @@ check_confounding(cox_f_full, cox_f_drop1)
 # cox_f_final <- coxph(Surv(time10, stroke10) ~ AGE + SYSBP + DIABETES + ...,
 #                      data = females)
 # summary(cox_f_final)
+```
+
+```{r}
+# --- FEMALE: Backward elimination ---
+
+# Step 1: Drop BMI (p = 0.713)
+cox_f_s1 <- coxph(Surv(time10, stroke10) ~ AGE + SYSBP + DIABETES +
+                    BPMEDS + CURSMOKE + TOTCHOL + PREVCHD, data = females)
+summary(cox_f_s1)
+check_confounding(cox_f_full, cox_f_s1)
+
+# Step 2: Drop TOTCHOL (p = 0.597)
+cox_f_s2 <- coxph(Surv(time10, stroke10) ~ AGE + SYSBP + DIABETES +
+                    BPMEDS + CURSMOKE + PREVCHD, data = females)
+summary(cox_f_s2)
+check_confounding(cox_f_full, cox_f_s2)
+
+# Step 3: Drop CURSMOKE (p = 0.216)
+cox_f_s3 <- coxph(Surv(time10, stroke10) ~ AGE + SYSBP + DIABETES +
+                    BPMEDS + PREVCHD, data = females)
+summary(cox_f_s3)
+check_confounding(cox_f_full, cox_f_s3)
+
+# Step 4: Drop PREVCHD (if p > 0.15 in step 3 model)
+cox_f_s4 <- coxph(Surv(time10, stroke10) ~ AGE + SYSBP + DIABETES +
+                    BPMEDS, data = females)
+summary(cox_f_s4)
+check_confounding(cox_f_full, cox_f_s4)
+
+# Step 5: Drop BPMEDS (if p > 0.15 in step 4 model)
+cox_f_s5 <- coxph(Surv(time10, stroke10) ~ AGE + SYSBP + DIABETES,
+                   data = females)
+summary(cox_f_s5)
+check_confounding(cox_f_full, cox_f_s5)
+
+
+# Correct path: drop BPMEDS from step 3 (it had p = 0.17), keep PREVCHD (p = 0.13)
+cox_f_candidate <- coxph(Surv(time10, stroke10) ~ AGE + SYSBP + DIABETES + PREVCHD,
+                         data = females)
+summary(cox_f_candidate)
+check_confounding(cox_f_full, cox_f_candidate)
 ```
 
 ```{r}
