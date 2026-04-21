@@ -347,27 +347,94 @@ summary(cox_f_candidate)
 check_confounding(cox_f_full, cox_f_candidate)
 ```
 
+
 ```{r}
-# ==============================================================================
-# SECTION 7: PROPORTIONAL HAZARDS DIAGNOSTICS
-# ==============================================================================
+# --- Final models ---
+cox_m_final <- coxph(Surv(time10, stroke10) ~ AGE + SYSBP + DIABETES + CURSMOKE,
+                     data = males)
+cox_f_final <- coxph(Surv(time10, stroke10) ~ AGE + SYSBP + DIABETES + BPMEDS + PREVCHD,
+                     data = females)
 
-# Schoenfeld residual test (run on final models; using forced model as placeholder)
-cox.zph(cox_m_forced)
-cox.zph(cox_f_forced)
+# --- PH diagnostics ---
+cox.zph(cox_m_final)
+cox.zph(cox_f_final)
 
-# Schoenfeld residual plots
 pdf("schoenfeld_males.pdf", width = 8, height = 6)
 par(mfrow = c(2, 2))
-plot(cox.zph(cox_m_forced))
+plot(cox.zph(cox_m_final))
 dev.off()
 
 pdf("schoenfeld_females.pdf", width = 8, height = 6)
 par(mfrow = c(2, 2))
-plot(cox.zph(cox_f_forced))
+plot(cox.zph(cox_f_final))
 dev.off()
 
-# Log-log survival plots by sex (visual PH check)
+# --- 10-year stroke probabilities ---
+risk_m <- data.frame(
+  AGE = c(40, 55, 65), SYSBP = c(120, 140, 160),
+  DIABETES = c(0, 0, 1), CURSMOKE = c(0, 1, 1),
+  Profile = c("Low", "Moderate", "High")
+)
+
+risk_f <- data.frame(
+  AGE = c(40, 55, 65), SYSBP = c(120, 140, 160),
+  DIABETES = c(0, 0, 1), BPMEDS = c(0, 0, 1), PREVCHD = c(0, 0, 1),
+  Profile = c("Low", "Moderate", "High")
+)
+
+# --- Corrected 10-year probability extraction ---
+
+# Males
+surv_m <- survfit(cox_m_final, newdata = risk_m %>% select(-Profile))
+surv_m_summ <- summary(surv_m, times = 3652)
+
+data.frame(
+  Profile     = risk_m$Profile,
+  Sex         = "Male",
+  Surv_10yr   = round(as.numeric(surv_m_summ$surv), 4),
+  Stroke_Prob = round(1 - as.numeric(surv_m_summ$surv), 4)
+)
+
+# Females
+surv_f <- survfit(cox_f_final, newdata = risk_f %>% select(-Profile))
+surv_f_summ <- summary(surv_f, times = 3652)
+
+data.frame(
+  Profile     = risk_f$Profile,
+  Sex         = "Female",
+  Surv_10yr   = round(as.numeric(surv_f_summ$surv), 4),
+  Stroke_Prob = round(1 - as.numeric(surv_f_summ$surv), 4)
+)
+
+
+```
+
+```{r}
+# ==============================================================================
+# SECTION 7: PROPORTIONAL HAZARDS DIAGNOSTICS (Final Models)
+# ==============================================================================
+
+cox_m_final <- coxph(Surv(time10, stroke10) ~ AGE + SYSBP + DIABETES + CURSMOKE,
+                     data = males)
+cox_f_final <- coxph(Surv(time10, stroke10) ~ AGE + SYSBP + DIABETES + BPMEDS + PREVCHD,
+                     data = females)
+
+# Schoenfeld residual tests
+cox.zph(cox_m_final)
+cox.zph(cox_f_final)
+
+# Schoenfeld residual plots
+pdf("schoenfeld_males.pdf", width = 8, height = 6)
+par(mfrow = c(2, 2))
+plot(cox.zph(cox_m_final))
+dev.off()
+
+pdf("schoenfeld_females.pdf", width = 8, height = 6)
+par(mfrow = c(2, 3))
+plot(cox.zph(cox_f_final))
+dev.off()
+
+# Log-log survival plots (visual PH check)
 pdf("loglog_sex.pdf", width = 7, height = 5)
 plot(km_sex, fun = "cloglog", col = c("blue", "red"), lwd = 2,
      xlab = "log(Time)", ylab = "log(-log(S(t)))",
@@ -380,45 +447,48 @@ dev.off()
 
 ```{r}
 # ==============================================================================
-# SECTION 8: 10-YEAR STROKE PROBABILITY ESTIMATES
+# SECTION 8: 10-YEAR STROKE PROBABILITY ESTIMATES (Final Models)
 # ==============================================================================
 
-# Define risk profiles (adjust model formula to match final model)
-# Using forced model as placeholder — update to final model after selection
-
-# Low risk: age 40, SBP 120, no diabetes
-# Moderate risk: age 55, SBP 140, no diabetes
-# High risk: age 65, SBP 160, diabetes
-
-risk_profiles <- data.frame(
+# Male risk profiles (model: AGE + SYSBP + DIABETES + CURSMOKE)
+risk_m <- data.frame(
   AGE      = c(40, 55, 65),
   SYSBP    = c(120, 140, 160),
-  DIABETES = c(0, 1, 1),
-  Profile  = c("Low Risk", "Moderate Risk", "High Risk")
+  DIABETES = c(0, 0, 1),
+  CURSMOKE = c(0, 1, 1),
+  Profile  = c("Low", "Moderate", "High")
 )
 
-# Male predictions
-surv_pred_m <- survfit(cox_m_forced,
-                       newdata = risk_profiles %>% select(-Profile))
-# Extract 10-year (3652-day) survival probabilities
-surv_summ_m <- summary(surv_pred_m, times = 3652)
+surv_m <- survfit(cox_m_final, newdata = risk_m %>% select(-Profile))
+surv_m_summ <- summary(surv_m, times = 3652)
+
 data.frame(
-  Profile     = risk_profiles$Profile,
+  Profile     = risk_m$Profile,
   Sex         = "Male",
-  Surv_10yr   = round(surv_summ_m$surv, 4),
-  Stroke_Prob = round(1 - surv_summ_m$surv, 4)
+  Surv_10yr   = round(as.numeric(surv_m_summ$surv), 4),
+  Stroke_Prob = round(1 - as.numeric(surv_m_summ$surv), 4)
 )
 
-# Female predictions
-surv_pred_f <- survfit(cox_f_forced,
-                       newdata = risk_profiles %>% select(-Profile))
-surv_summ_f <- summary(surv_pred_f, times = 3652)
-data.frame(
-  Profile     = risk_profiles$Profile,
-  Sex         = "Female",
-  Surv_10yr   = round(surv_summ_f$surv, 4),
-  Stroke_Prob = round(1 - surv_summ_f$surv, 4)
+# Female risk profiles (model: AGE + SYSBP + DIABETES + BPMEDS + PREVCHD)
+risk_f <- data.frame(
+  AGE     = c(40, 55, 65),
+  SYSBP   = c(120, 140, 160),
+  DIABETES = c(0, 0, 1),
+  BPMEDS  = c(0, 0, 1),
+  PREVCHD = c(0, 0, 1),
+  Profile = c("Low", "Moderate", "High")
 )
+
+surv_f <- survfit(cox_f_final, newdata = risk_f %>% select(-Profile))
+surv_f_summ <- summary(surv_f, times = 3652)
+
+data.frame(
+  Profile     = risk_f$Profile,
+  Sex         = "Female",
+  Surv_10yr   = round(as.numeric(surv_f_summ$surv), 4),
+  Stroke_Prob = round(1 - as.numeric(surv_f_summ$surv), 4)
+)
+
 ```
 
 ```{r}
@@ -439,23 +509,21 @@ dat_all3 %>%
   summarise(n = n(), mean = mean(SYSBP, na.rm = TRUE),
             sd = sd(SYSBP, na.rm = TRUE), median = median(SYSBP, na.rm = TRUE))
 
-# 9b. SYSBP change: P1->P2, P2->P3, and P1->P3
+# 9b. SYSBP within-person changes: P1->P2, P2->P3, P1->P3
 wide_sysbp <- dat_all3 %>%
   select(RANDID, PERIOD, SYSBP) %>%
-  pivot_wider(names_from = PERIOD, values_from = SYSBP, names_prefix = "P")
-
-wide_sysbp <- wide_sysbp %>%
+  pivot_wider(names_from = PERIOD, values_from = SYSBP, names_prefix = "P") %>%
   mutate(delta_12 = P2 - P1,
          delta_23 = P3 - P2,
          delta_13 = P3 - P1)
 
-writeLines("SYSBP Change: Period 1 -> Period 2")
+writeLines("SYSBP Within-Person Change: Period 1 -> Period 2")
 summary(wide_sysbp$delta_12)
 
-writeLines("SYSBP Change: Period 2 -> Period 3")
+writeLines("SYSBP Within-Person Change: Period 2 -> Period 3")
 summary(wide_sysbp$delta_23)
 
-writeLines("SYSBP Change: Period 1 -> Period 3")
+writeLines("SYSBP Within-Person Change: Period 1 -> Period 3")
 summary(wide_sysbp$delta_13)
 
 # 9c. Diabetes prevalence by period
@@ -464,7 +532,7 @@ dat_all3 %>%
   summarise(n = n(), n_diabetes = sum(DIABETES, na.rm = TRUE),
             pct = mean(DIABETES, na.rm = TRUE) * 100)
 
-# 9d. Diabetes transitions: P1->P2, P2->P3, P1->P3
+# 9d. Diabetes transitions at each interval
 wide_diab <- dat_all3 %>%
   select(RANDID, PERIOD, DIABETES) %>%
   pivot_wider(names_from = PERIOD, values_from = DIABETES, names_prefix = "P")
