@@ -1,0 +1,765 @@
+---
+title: "Untitled"
+author: "Qingyang Du"
+date: "2026-05-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# ============================================================
+# Variable Selection Simulation Study
+# BIOS 6624 - Spring 2026
+# [Your Name]
+# ============================================================
+
+# ============================================================
+# SECTION 1: SETUP
+# ============================================================
+
+library(MASS)
+library(glmnet)
+
+set.seed(6624)
+
+# --- Simulation parameters ---
+n_sim        <- 50
+sample_sizes <- c(250, 500)
+rho_values   <- c(0, 0.35, 0.7)
+p            <- 20
+true_idx     <- 1:5
+null_idx     <- 6:20
+true_betas   <- c(0.5, 1.0, 1.5, 2.0, 2.5) / 3
+all_betas    <- c(true_betas, rep(0, 15))
+
+method_names <- c("Backward_F", "AIC", "BIC",
+                   "Lasso_min", "Lasso_1se",
+                   "ENet_min", "ENet_1se")
+n_methods    <- length(method_names)
+
+# ============================================================
+# SECTION 2: HELPER FUNCTIONS
+# ============================================================
+
+# --- 2a. Data generation ---
+generate_data <- function(n, p, betas, rho) {
+  Sigma <- matrix(rho, nrow = p, ncol = p)
+  diag(Sigma) <- 1
+  X   <- mvrnorm(n = n, mu = rep(0, p), Sigma = Sigma)
+  colnames(X) <- paste0("X", 1:p)
+  eps <- rnorm(n)
+  Y   <- X %*% betas + eps
+  dat <- data.frame(Y = as.numeric(Y), X)
+  return(dat)
+}
+
+# --- 2b. Backward elimination by F-test ---
+backward_f_select <- function(dat, alpha = 0.05) {
+  current_vars <- paste0("X", 1:20)
+
+  repeat {
+    if (length(current_vars) == 0) break
+
+    fmla <- as.formula(paste("Y ~", paste(current_vars, collapse = " + ")))
+    fit  <- lm(fmla, data = dat)
+    pvals <- summary(fit)$coefficients[-1, 4]
+
+    max_p   <- max(pvals)
+    if (max_p > alpha) {
+      drop_var     <- names(which.max(pvals))
+      current_vars <- setdiff(current_vars, drop_var)
+    } else {
+      break
+    }
+  }
+
+  selected <- paste0("X", 1:20) %in% current_vars
+  names(selected) <- paste0("X", 1:20)
+  return(selected)
+}
+
+# --- 2c. AIC-based backward selection ---
+aic_select <- function(dat) {
+  full    <- lm(Y ~ ., data = dat)
+  reduced <- step(full, direction = "backward", k = 2, trace = 0)
+  selected_names <- names(coef(reduced))[-1]
+  selected <- paste0("X", 1:20) %in% selected_names
+  names(selected) <- paste0("X", 1:20)
+  return(selected)
+}
+
+# --- 2d. BIC-based backward selection ---
+bic_select <- function(dat) {
+  n       <- nrow(dat)
+  full    <- lm(Y ~ ., data = dat)
+  reduced <- step(full, direction = "backward", k = log(n), trace = 0)
+  selected_names <- names(coef(reduced))[-1]
+  selected <- paste0("X", 1:20) %in% selected_names
+  names(selected) <- paste0("X", 1:20)
+  return(selected)
+}
+
+# --- 2e. Penalized regression (lasso or elastic net) ---
+penalized_select <- function(X_mat, Y_vec, alpha_val, lambda_rule) {
+  cv_fit <- cv.glmnet(X_mat, Y_vec, alpha = alpha_val, nfolds = 10)
+
+  if (lambda_rule == "min") {
+    lambda_use <- cv_fit$lambda.min
+  } else {
+    lambda_use <- cv_fit$lambda.1se
+  }
+
+  coefs    <- as.numeric(coef(cv_fit, s = lambda_use))[-1]
+  selected <- (coefs != 0)
+  names(selected) <- paste0("X", 1:20)
+  return(selected)
+}
+
+# --- 2f. Refit OLS on selected variables and extract inference ---
+#     Returns beta_hat (length p, 0 if not selected),
+#             ci_lower, ci_upper (NA if not selected),
+#             pvals (NA if not selected)
+refit_ols <- function(dat, selected) {
+  var_names <- paste0("X", 1:20)
+  beta_hat  <- rep(0, 20)
+  ci_lower  <- rep(NA_real_, 20)
+  ci_upper  <- rep(NA_real_, 20)
+  pvals     <- rep(NA_real_, 20)
+  names(beta_hat) <- names(ci_lower) <- names(ci_upper) <- names(pvals) <- var_names
+
+  sel_vars <- var_names[selected]
+
+  if (length(sel_vars) == 0) {
+    return(list(beta_hat = beta_hat,
+                ci_lower = ci_lower,
+                ci_upper = ci_upper,
+                pvals    = pvals))
+  }
+
+  fmla <- as.formula(paste("Y ~", paste(sel_vars, collapse = " + ")))
+  fit  <- lm(fmla, data = dat)
+
+  coefs <- summary(fit)$coefficients
+  ci    <- confint(fit, level = 0.95)
+
+  for (v in sel_vars) {
+    beta_hat[v] <- coefs[v, 1]
+    pvals[v]    <- coefs[v, 4]
+    ci_lower[v] <- ci[v, 1]
+    ci_upper[v] <- ci[v, 2]
+  }
+
+  return(list(beta_hat = beta_hat,
+              ci_lower = ci_lower,
+              ci_upper = ci_upper,
+              pvals    = pvals))
+}
+
+# ============================================================
+# SECTION 3: MAIN SIMULATION LOOP
+# ============================================================
+
+# --- Storage list: one entry per scenario ---
+results_all <- list()
+
+scenario_id <- 0
+
+for (N in sample_sizes) {
+  for (rho in rho_values) {
+
+    scenario_id   <- scenario_id + 1
+    scenario_name <- paste0("N", N, "_rho", rho)
+    message("Starting scenario: ", scenario_name)
+
+    # --- Initialize arrays for this scenario ---
+    # Naive approach: selection + refit on full data
+    selected_arr <- array(FALSE, dim = c(n_sim, p, n_methods),
+                          dimnames = list(NULL, paste0("X", 1:p), method_names))
+    beta_hat_arr <- array(0,     dim = c(n_sim, p, n_methods),
+                          dimnames = list(NULL, paste0("X", 1:p), method_names))
+    ci_lower_arr <- array(NA_real_, dim = c(n_sim, p, n_methods),
+                          dimnames = list(NULL, paste0("X", 1:p), method_names))
+    ci_upper_arr <- array(NA_real_, dim = c(n_sim, p, n_methods),
+                          dimnames = list(NULL, paste0("X", 1:p), method_names))
+    pval_arr     <- array(NA_real_, dim = c(n_sim, p, n_methods),
+                          dimnames = list(NULL, paste0("X", 1:p), method_names))
+
+    # Data-splitting approach: select on first half, refit on second half
+    ds_selected_arr <- array(FALSE,    dim = c(n_sim, p, n_methods),
+                             dimnames = list(NULL, paste0("X", 1:p), method_names))
+    ds_beta_hat_arr <- array(0,        dim = c(n_sim, p, n_methods),
+                             dimnames = list(NULL, paste0("X", 1:p), method_names))
+    ds_ci_lower_arr <- array(NA_real_, dim = c(n_sim, p, n_methods),
+                             dimnames = list(NULL, paste0("X", 1:p), method_names))
+    ds_ci_upper_arr <- array(NA_real_, dim = c(n_sim, p, n_methods),
+                             dimnames = list(NULL, paste0("X", 1:p), method_names))
+    ds_pval_arr     <- array(NA_real_, dim = c(n_sim, p, n_methods),
+                             dimnames = list(NULL, paste0("X", 1:p), method_names))
+
+    for (sim in 1:n_sim) {
+
+      if (sim %% 100 == 0) message("  Replicate ", sim, " / ", n_sim)
+
+      # --- Generate data ---
+      dat   <- generate_data(n = N, p = p, betas = all_betas, rho = rho)
+      X_mat <- as.matrix(dat[, -1])
+      Y_vec <- dat$Y
+
+      # --- Data split indices ---
+      half   <- floor(N / 2)
+      idx1   <- 1:half
+      idx2   <- (half + 1):N
+      dat1   <- dat[idx1, ]
+      dat2   <- dat[idx2, ]
+      X_mat1 <- X_mat[idx1, ]
+      Y_vec1 <- Y_vec[idx1]
+
+      # ---- Apply each selection method ----
+
+      # 1. Backward F-test
+      sel <- backward_f_select(dat)
+      selected_arr[sim, , "Backward_F"] <- sel
+      refit <- refit_ols(dat, sel)
+      beta_hat_arr[sim, , "Backward_F"] <- refit$beta_hat
+      ci_lower_arr[sim, , "Backward_F"] <- refit$ci_lower
+      ci_upper_arr[sim, , "Backward_F"] <- refit$ci_upper
+      pval_arr[sim, , "Backward_F"]     <- refit$pvals
+
+      sel_ds <- backward_f_select(dat1)
+      ds_selected_arr[sim, , "Backward_F"] <- sel_ds
+      refit_ds <- refit_ols(dat2, sel_ds)
+      ds_beta_hat_arr[sim, , "Backward_F"] <- refit_ds$beta_hat
+      ds_ci_lower_arr[sim, , "Backward_F"] <- refit_ds$ci_lower
+      ds_ci_upper_arr[sim, , "Backward_F"] <- refit_ds$ci_upper
+      ds_pval_arr[sim, , "Backward_F"]     <- refit_ds$pvals
+
+      # 2. AIC
+      sel <- aic_select(dat)
+      selected_arr[sim, , "AIC"] <- sel
+      refit <- refit_ols(dat, sel)
+      beta_hat_arr[sim, , "AIC"] <- refit$beta_hat
+      ci_lower_arr[sim, , "AIC"] <- refit$ci_lower
+      ci_upper_arr[sim, , "AIC"] <- refit$ci_upper
+      pval_arr[sim, , "AIC"]     <- refit$pvals
+
+      sel_ds <- aic_select(dat1)
+      ds_selected_arr[sim, , "AIC"] <- sel_ds
+      refit_ds <- refit_ols(dat2, sel_ds)
+      ds_beta_hat_arr[sim, , "AIC"] <- refit_ds$beta_hat
+      ds_ci_lower_arr[sim, , "AIC"] <- refit_ds$ci_lower
+      ds_ci_upper_arr[sim, , "AIC"] <- refit_ds$ci_upper
+      ds_pval_arr[sim, , "AIC"]     <- refit_ds$pvals
+
+      # 3. BIC
+      sel <- bic_select(dat)
+      selected_arr[sim, , "BIC"] <- sel
+      refit <- refit_ols(dat, sel)
+      beta_hat_arr[sim, , "BIC"] <- refit$beta_hat
+      ci_lower_arr[sim, , "BIC"] <- refit$ci_lower
+      ci_upper_arr[sim, , "BIC"] <- refit$ci_upper
+      pval_arr[sim, , "BIC"]     <- refit$pvals
+
+      sel_ds <- bic_select(dat1)
+      ds_selected_arr[sim, , "BIC"] <- sel_ds
+      refit_ds <- refit_ols(dat2, sel_ds)
+      ds_beta_hat_arr[sim, , "BIC"] <- refit_ds$beta_hat
+      ds_ci_lower_arr[sim, , "BIC"] <- refit_ds$ci_lower
+      ds_ci_upper_arr[sim, , "BIC"] <- refit_ds$ci_upper
+      ds_pval_arr[sim, , "BIC"]     <- refit_ds$pvals
+
+      # 4. Lasso - lambda.min
+      sel <- penalized_select(X_mat, Y_vec, alpha_val = 1, lambda_rule = "min")
+      selected_arr[sim, , "Lasso_min"] <- sel
+      refit <- refit_ols(dat, sel)
+      beta_hat_arr[sim, , "Lasso_min"] <- refit$beta_hat
+      ci_lower_arr[sim, , "Lasso_min"] <- refit$ci_lower
+      ci_upper_arr[sim, , "Lasso_min"] <- refit$ci_upper
+      pval_arr[sim, , "Lasso_min"]     <- refit$pvals
+
+      sel_ds <- penalized_select(X_mat1, Y_vec1, alpha_val = 1, lambda_rule = "min")
+      ds_selected_arr[sim, , "Lasso_min"] <- sel_ds
+      refit_ds <- refit_ols(dat2, sel_ds)
+      ds_beta_hat_arr[sim, , "Lasso_min"] <- refit_ds$beta_hat
+      ds_ci_lower_arr[sim, , "Lasso_min"] <- refit_ds$ci_lower
+      ds_ci_upper_arr[sim, , "Lasso_min"] <- refit_ds$ci_upper
+      ds_pval_arr[sim, , "Lasso_min"]     <- refit_ds$pvals
+
+      # 5. Lasso - lambda.1se
+      sel <- penalized_select(X_mat, Y_vec, alpha_val = 1, lambda_rule = "1se")
+      selected_arr[sim, , "Lasso_1se"] <- sel
+      refit <- refit_ols(dat, sel)
+      beta_hat_arr[sim, , "Lasso_1se"] <- refit$beta_hat
+      ci_lower_arr[sim, , "Lasso_1se"] <- refit$ci_lower
+      ci_upper_arr[sim, , "Lasso_1se"] <- refit$ci_upper
+      pval_arr[sim, , "Lasso_1se"]     <- refit$pvals
+
+      sel_ds <- penalized_select(X_mat1, Y_vec1, alpha_val = 1, lambda_rule = "1se")
+      ds_selected_arr[sim, , "Lasso_1se"] <- sel_ds
+      refit_ds <- refit_ols(dat2, sel_ds)
+      ds_beta_hat_arr[sim, , "Lasso_1se"] <- refit_ds$beta_hat
+      ds_ci_lower_arr[sim, , "Lasso_1se"] <- refit_ds$ci_lower
+      ds_ci_upper_arr[sim, , "Lasso_1se"] <- refit_ds$ci_upper
+      ds_pval_arr[sim, , "Lasso_1se"]     <- refit_ds$pvals
+
+      # 6. Elastic net - lambda.min
+      sel <- penalized_select(X_mat, Y_vec, alpha_val = 0.5, lambda_rule = "min")
+      selected_arr[sim, , "ENet_min"] <- sel
+      refit <- refit_ols(dat, sel)
+      beta_hat_arr[sim, , "ENet_min"] <- refit$beta_hat
+      ci_lower_arr[sim, , "ENet_min"] <- refit$ci_lower
+      ci_upper_arr[sim, , "ENet_min"] <- refit$ci_upper
+      pval_arr[sim, , "ENet_min"]     <- refit$pvals
+
+      sel_ds <- penalized_select(X_mat1, Y_vec1, alpha_val = 0.5, lambda_rule = "min")
+      ds_selected_arr[sim, , "ENet_min"] <- sel_ds
+      refit_ds <- refit_ols(dat2, sel_ds)
+      ds_beta_hat_arr[sim, , "ENet_min"] <- refit_ds$beta_hat
+      ds_ci_lower_arr[sim, , "ENet_min"] <- refit_ds$ci_lower
+      ds_ci_upper_arr[sim, , "ENet_min"] <- refit_ds$ci_upper
+      ds_pval_arr[sim, , "ENet_min"]     <- refit_ds$pvals
+
+      # 7. Elastic net - lambda.1se
+      sel <- penalized_select(X_mat, Y_vec, alpha_val = 0.5, lambda_rule = "1se")
+      selected_arr[sim, , "ENet_1se"] <- sel
+      refit <- refit_ols(dat, sel)
+      beta_hat_arr[sim, , "ENet_1se"] <- refit$beta_hat
+      ci_lower_arr[sim, , "ENet_1se"] <- refit$ci_lower
+      ci_upper_arr[sim, , "ENet_1se"] <- refit$ci_upper
+      pval_arr[sim, , "ENet_1se"]     <- refit$pvals
+
+      sel_ds <- penalized_select(X_mat1, Y_vec1, alpha_val = 0.5, lambda_rule = "1se")
+      ds_selected_arr[sim, , "ENet_1se"] <- sel_ds
+      refit_ds <- refit_ols(dat2, sel_ds)
+      ds_beta_hat_arr[sim, , "ENet_1se"] <- refit_ds$beta_hat
+      ds_ci_lower_arr[sim, , "ENet_1se"] <- refit_ds$ci_lower
+      ds_ci_upper_arr[sim, , "ENet_1se"] <- refit_ds$ci_upper
+      ds_pval_arr[sim, , "ENet_1se"]     <- refit_ds$pvals
+
+    } # end sim loop
+
+    # --- Store results for this scenario ---
+    results_all[[scenario_name]] <- list(
+      N    = N,
+      rho  = rho,
+      # Naive
+      selected = selected_arr,
+      beta_hat = beta_hat_arr,
+      ci_lower = ci_lower_arr,
+      ci_upper = ci_upper_arr,
+      pvals    = pval_arr,
+      # Data splitting
+      ds_selected = ds_selected_arr,
+      ds_beta_hat = ds_beta_hat_arr,
+      ds_ci_lower = ds_ci_lower_arr,
+      ds_ci_upper = ds_ci_upper_arr,
+      ds_pvals    = ds_pval_arr
+    )
+
+    message("Finished scenario: ", scenario_name)
+
+  } # end rho loop
+} # end N loop
+
+
+# ============================================================
+# SECTION 4: COMPUTE PERFORMANCE METRICS
+# ============================================================
+
+compute_metrics <- function(res, all_betas, true_idx, null_idx) {
+
+  n_methods <- dim(res$selected)[3]
+  mnames    <- dimnames(res$selected)[[3]]
+  var_names <- paste0("X", 1:20)
+
+  # --- Container for summary ---
+  metric_list <- list()
+
+  for (m in 1:n_methods) {
+
+    mname <- mnames[m]
+
+    # --- Extract arrays for this method ---
+    sel   <- res$selected[, , m]      # n_sim x p logical
+    bhat  <- res$beta_hat[, , m]      # n_sim x p
+    cil   <- res$ci_lower[, , m]
+    ciu   <- res$ci_upper[, , m]
+    pvs   <- res$pvals[, , m]
+
+    ds_sel  <- res$ds_selected[, , m]
+    ds_bhat <- res$ds_beta_hat[, , m]
+    ds_cil  <- res$ds_ci_lower[, , m]
+    ds_ciu  <- res$ds_ci_upper[, , m]
+    ds_pvs  <- res$ds_pvals[, , m]
+
+    # ---- Selection rates ----
+    selection_rate <- colMeans(sel)
+    ds_selection_rate <- colMeans(ds_sel)
+
+    # ---- True positive rate (per true variable) ----
+    tpr     <- selection_rate[true_idx]
+    ds_tpr  <- ds_selection_rate[true_idx]
+
+    # ---- False positive rate (per null variable and average) ----
+    fpr         <- selection_rate[null_idx]
+    fpr_avg     <- mean(fpr)
+    ds_fpr      <- ds_selection_rate[null_idx]
+    ds_fpr_avg  <- mean(ds_fpr)
+
+    # ---- Bias (unconditional: non-selected = 0) ----
+    bias <- colMeans(bhat) - all_betas
+    ds_bias <- colMeans(ds_bhat) - all_betas
+
+    # ---- 95% CI coverage ----
+    # For selected variables: check if CI contains the true beta
+    # For non-selected true predictors: non-coverage (true beta != 0)
+    # For non-selected null predictors: coverage (true beta = 0, est = 0)
+    coverage <- rep(NA_real_, 20)
+    ds_coverage <- rep(NA_real_, 20)
+    names(coverage) <- names(ds_coverage) <- var_names
+
+    for (j in 1:20) {
+      # Naive
+      covers_j <- rep(FALSE, nrow(sel))
+      sel_j    <- sel[, j]
+
+      # When selected: check CI
+      if (any(sel_j)) {
+        covers_j[sel_j] <- (cil[sel_j, j] <= all_betas[j]) &
+                            (ciu[sel_j, j] >= all_betas[j])
+      }
+      # When not selected:
+      #   true predictor (beta != 0) -> non-coverage (FALSE, already default)
+      #   null predictor (beta == 0) -> coverage (TRUE)
+      if (j %in% null_idx) {
+        covers_j[!sel_j] <- TRUE
+      }
+      coverage[j] <- mean(covers_j)
+
+      # Data splitting
+      ds_covers_j <- rep(FALSE, nrow(ds_sel))
+      ds_sel_j    <- ds_sel[, j]
+      if (any(ds_sel_j)) {
+        ds_covers_j[ds_sel_j] <- (ds_cil[ds_sel_j, j] <= all_betas[j]) &
+                                  (ds_ciu[ds_sel_j, j] >= all_betas[j])
+      }
+      if (j %in% null_idx) {
+        ds_covers_j[!ds_sel_j] <- TRUE
+      }
+      ds_coverage[j] <- mean(ds_covers_j)
+    }
+
+    # ---- Type I error (null predictors) ----
+    # A null predictor contributes a Type I error if it is selected
+    # AND has p < 0.05 in the refit model.
+    # Non-selection of a null predictor = correct decision (no error).
+    type1 <- rep(NA_real_, length(null_idx))
+    ds_type1 <- rep(NA_real_, length(null_idx))
+    names(type1) <- names(ds_type1) <- var_names[null_idx]
+
+    for (k in seq_along(null_idx)) {
+      j <- null_idx[k]
+      # Naive
+      sig_j <- rep(FALSE, nrow(sel))
+      sel_j <- sel[, j]
+      if (any(sel_j)) {
+        sig_j[sel_j] <- pvs[sel_j, j] < 0.05
+      }
+      type1[k] <- mean(sig_j)
+
+      # Data splitting
+      ds_sig_j <- rep(FALSE, nrow(ds_sel))
+      ds_sel_j <- ds_sel[, j]
+      if (any(ds_sel_j)) {
+        ds_sig_j[ds_sel_j] <- ds_pvs[ds_sel_j, j] < 0.05
+      }
+      ds_type1[k] <- mean(ds_sig_j)
+    }
+
+    # ---- Type II error (true predictors) ----
+    # A true predictor contributes a Type II error if it is NOT selected
+    # OR if selected but NOT significant (p >= 0.05) in the refit model.
+    type2 <- rep(NA_real_, length(true_idx))
+    ds_type2 <- rep(NA_real_, length(true_idx))
+    names(type2) <- names(ds_type2) <- var_names[true_idx]
+
+    for (k in seq_along(true_idx)) {
+      j <- true_idx[k]
+      # Naive
+      error_j <- rep(TRUE, nrow(sel))   # default: error
+      sel_j   <- sel[, j]
+      if (any(sel_j)) {
+        error_j[sel_j] <- pvs[sel_j, j] >= 0.05
+      }
+      type2[k] <- mean(error_j)
+
+      # Data splitting
+      ds_error_j <- rep(TRUE, nrow(ds_sel))
+      ds_sel_j   <- ds_sel[, j]
+      if (any(ds_sel_j)) {
+        ds_error_j[ds_sel_j] <- ds_pvs[ds_sel_j, j] >= 0.05
+      }
+      ds_type2[k] <- mean(ds_error_j)
+    }
+
+    # ---- Store ----
+    metric_list[[mname]] <- list(
+      # Selection
+      tpr          = tpr,
+      fpr          = fpr,
+      fpr_avg      = fpr_avg,
+      # Naive inference
+      bias         = bias,
+      coverage     = coverage,
+      type1        = type1,
+      type1_avg    = mean(type1),
+      type2        = type2,
+      # Data-splitting inference
+      ds_tpr       = ds_tpr,
+      ds_fpr       = ds_fpr,
+      ds_fpr_avg   = ds_fpr_avg,
+      ds_bias      = ds_bias,
+      ds_coverage  = ds_coverage,
+      ds_type1     = ds_type1,
+      ds_type1_avg = mean(ds_type1),
+      ds_type2     = ds_type2
+    )
+
+  } # end method loop
+
+  return(metric_list)
+}
+
+
+# --- Apply to all scenarios ---
+metrics_all <- list()
+for (sc in names(results_all)) {
+  message("Computing metrics for: ", sc)
+  metrics_all[[sc]] <- compute_metrics(results_all[[sc]],
+                                        all_betas, true_idx, null_idx)
+}
+
+
+# ============================================================
+# SECTION 5: BUILD SUMMARY TABLES
+# ============================================================
+
+# --- 5a. True positive rate table (per true variable, per method) ---
+build_tpr_table <- function(metrics_all, inference = "naive") {
+
+  scenarios <- names(metrics_all)
+  rows <- list()
+
+  for (sc in scenarios) {
+    for (mname in names(metrics_all[[sc]])) {
+      m <- metrics_all[[sc]][[mname]]
+      tpr_vals <- if (inference == "naive") m$tpr else m$ds_tpr
+      row <- data.frame(
+        Scenario = sc,
+        Method   = mname,
+        X1 = tpr_vals[1],
+        X2 = tpr_vals[2],
+        X3 = tpr_vals[3],
+        X4 = tpr_vals[4],
+        X5 = tpr_vals[5],
+        stringsAsFactors = FALSE
+      )
+      rows[[length(rows) + 1]] <- row
+    }
+  }
+  do.call(rbind, rows)
+}
+
+# --- 5b. False positive rate table (average over X6-X20) ---
+build_fpr_table <- function(metrics_all, inference = "naive") {
+
+  scenarios <- names(metrics_all)
+  rows <- list()
+
+  for (sc in scenarios) {
+    for (mname in names(metrics_all[[sc]])) {
+      m <- metrics_all[[sc]][[mname]]
+      fpr_val <- if (inference == "naive") m$fpr_avg else m$ds_fpr_avg
+      row <- data.frame(
+        Scenario = sc,
+        Method   = mname,
+        FPR_avg  = fpr_val,
+        stringsAsFactors = FALSE
+      )
+      rows[[length(rows) + 1]] <- row
+    }
+  }
+  do.call(rbind, rows)
+}
+
+# --- 5c. Bias table (per true variable) ---
+build_bias_table <- function(metrics_all, inference = "naive") {
+
+  scenarios <- names(metrics_all)
+  rows <- list()
+
+  for (sc in scenarios) {
+    for (mname in names(metrics_all[[sc]])) {
+      m <- metrics_all[[sc]][[mname]]
+      b <- if (inference == "naive") m$bias else m$ds_bias
+      row <- data.frame(
+        Scenario = sc,
+        Method   = mname,
+        X1 = round(b[1], 4),
+        X2 = round(b[2], 4),
+        X3 = round(b[3], 4),
+        X4 = round(b[4], 4),
+        X5 = round(b[5], 4),
+        stringsAsFactors = FALSE
+      )
+      rows[[length(rows) + 1]] <- row
+    }
+  }
+  do.call(rbind, rows)
+}
+
+# --- 5d. Coverage table (per true variable) ---
+build_coverage_table <- function(metrics_all, inference = "naive") {
+
+  scenarios <- names(metrics_all)
+  rows <- list()
+
+  for (sc in scenarios) {
+    for (mname in names(metrics_all[[sc]])) {
+      m <- metrics_all[[sc]][[mname]]
+      cov_vals <- if (inference == "naive") m$coverage else m$ds_coverage
+      row <- data.frame(
+        Scenario = sc,
+        Method   = mname,
+        X1 = cov_vals[1],
+        X2 = cov_vals[2],
+        X3 = cov_vals[3],
+        X4 = cov_vals[4],
+        X5 = cov_vals[5],
+        stringsAsFactors = FALSE
+      )
+      rows[[length(rows) + 1]] <- row
+    }
+  }
+  do.call(rbind, rows)
+}
+
+# --- 5e. Type I error table (average over null variables) ---
+build_type1_table <- function(metrics_all, inference = "naive") {
+
+  scenarios <- names(metrics_all)
+  rows <- list()
+
+  for (sc in scenarios) {
+    for (mname in names(metrics_all[[sc]])) {
+      m <- metrics_all[[sc]][[mname]]
+      t1 <- if (inference == "naive") m$type1_avg else m$ds_type1_avg
+      row <- data.frame(
+        Scenario = sc,
+        Method   = mname,
+        Type1_avg = t1,
+        stringsAsFactors = FALSE
+      )
+      rows[[length(rows) + 1]] <- row
+    }
+  }
+  do.call(rbind, rows)
+}
+
+# --- 5f. Type II error table (per true variable) ---
+build_type2_table <- function(metrics_all, inference = "naive") {
+
+  scenarios <- names(metrics_all)
+  rows <- list()
+
+  for (sc in scenarios) {
+    for (mname in names(metrics_all[[sc]])) {
+      m <- metrics_all[[sc]][[mname]]
+      t2 <- if (inference == "naive") m$type2 else m$ds_type2
+      row <- data.frame(
+        Scenario = sc,
+        Method   = mname,
+        X1 = t2[1],
+        X2 = t2[2],
+        X3 = t2[3],
+        X4 = t2[4],
+        X5 = t2[5],
+        stringsAsFactors = FALSE
+      )
+      rows[[length(rows) + 1]] <- row
+    }
+  }
+  do.call(rbind, rows)
+}
+
+
+# --- Generate all summary tables ---
+tpr_naive     <- build_tpr_table(metrics_all, "naive")
+tpr_ds        <- build_tpr_table(metrics_all, "ds")
+
+fpr_naive     <- build_fpr_table(metrics_all, "naive")
+fpr_ds        <- build_fpr_table(metrics_all, "ds")
+
+bias_naive    <- build_bias_table(metrics_all, "naive")
+bias_ds       <- build_bias_table(metrics_all, "ds")
+
+cov_naive     <- build_coverage_table(metrics_all, "naive")
+cov_ds        <- build_coverage_table(metrics_all, "ds")
+
+type1_naive   <- build_type1_table(metrics_all, "naive")
+type1_ds      <- build_type1_table(metrics_all, "ds")
+
+type2_naive   <- build_type2_table(metrics_all, "naive")
+type2_ds      <- build_type2_table(metrics_all, "ds")
+
+# --- Print summary tables ---
+message("\n=== TRUE POSITIVE RATES (Naive) ===")
+print(tpr_naive, row.names = FALSE)
+
+message("\n=== FALSE POSITIVE RATES (Naive) ===")
+print(fpr_naive, row.names = FALSE)
+
+message("\n=== BIAS (Naive) ===")
+print(bias_naive, row.names = FALSE)
+
+message("\n=== 95% CI COVERAGE (Naive) ===")
+print(cov_naive, row.names = FALSE)
+
+message("\n=== TYPE I ERROR (Naive) ===")
+print(type1_naive, row.names = FALSE)
+
+message("\n=== TYPE II ERROR (Naive) ===")
+print(type2_naive, row.names = FALSE)
+
+message("\n=== TRUE POSITIVE RATES (Data Splitting) ===")
+print(tpr_ds, row.names = FALSE)
+
+message("\n=== 95% CI COVERAGE (Data Splitting) ===")
+print(cov_ds, row.names = FALSE)
+
+message("\n=== TYPE I ERROR (Data Splitting) ===")
+print(type1_ds, row.names = FALSE)
+
+message("\n=== TYPE II ERROR (Data Splitting) ===")
+print(type2_ds, row.names = FALSE)
+
+
+# ============================================================
+# SECTION 6: SAVE RESULTS
+# ============================================================
+
+save(results_all, metrics_all,
+     tpr_naive, tpr_ds,
+     fpr_naive, fpr_ds,
+     bias_naive, bias_ds,
+     cov_naive, cov_ds,
+     type1_naive, type1_ds,
+     type2_naive, type2_ds,
+     file = "simulation_results.RData")
+
+message("All results saved to simulation_results.RData")
+
+
+```
