@@ -11,12 +11,6 @@ knitr::opts_chunk$set(echo = TRUE)
 
 ```{r}
 # ============================================================
-# Variable Selection Simulation Study
-# BIOS 6624 - Spring 2026
-# [Your Name]
-# ============================================================
-
-# ============================================================
 # SECTION 1: SETUP
 # ============================================================
 
@@ -26,7 +20,7 @@ library(glmnet)
 set.seed(6624)
 
 # --- Simulation parameters ---
-n_sim        <- 50
+n_sim        <- 10000
 sample_sizes <- c(250, 500)
 rho_values   <- c(0, 0.35, 0.7)
 p            <- 20
@@ -104,7 +98,7 @@ bic_select <- function(dat) {
 
 # --- 2e. Penalized regression (lasso or elastic net) ---
 penalized_select <- function(X_mat, Y_vec, alpha_val, lambda_rule) {
-  cv_fit <- cv.glmnet(X_mat, Y_vec, alpha = alpha_val, nfolds = 10)
+  cv_fit <- cv.glmnet(X_mat, Y_vec, alpha = alpha_val, nfolds = 5)
 
   if (lambda_rule == "min") {
     lambda_use <- cv_fit$lambda.min
